@@ -194,3 +194,4 @@ Doute sur bruit :
 - PROPERLY MATCH COGS (FRAME MATCHING)
 - enhanced stack experiment -> run ce soir? 
 - notes pour la suite
+- gap handling

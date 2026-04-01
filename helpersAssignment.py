@@ -2,6 +2,7 @@ import numpy as np
 import sys
 from hungarian_algorithm import algorithm
 
+# ------------------------ Assignment algorithms -------------------------
 def local_nn_assignment(cost_matrix, max_distance=10):
     """
     Local nearest neighbor assignment based on the cost matrix. Can be used as a simple baseline for assignment, but does 
@@ -197,31 +198,93 @@ def hungarian_pypi(cost):
     return min_cost, assignment
 
 
+# def cog(trajectory):
+#     positions = trajectory.get_positions()
+#     if len(positions) == 0:
+#         print(f"Found no positions for trajectory {trajectory.id} -> set id to None")
+#         return None
+#     rows = [pos[0] for pos in positions]
+#     cols = [pos[1] for pos in positions]
+#     cog_row = np.mean(rows) # simple mean in rows
+#     cog_col = np.mean(cols) # simple mean in cols
+#     return (float(cog_row), float(cog_col))
+
+# ------------------------- Cost function and cost matrix for assignment -------------------------
 def cog(trajectory):
     positions = trajectory.get_positions()
     if len(positions) == 0:
-        print(f"Found no positions for trajectory {trajectory.id} -> set id to None")
         return None
+
     rows = [pos[0] for pos in positions]
     cols = [pos[1] for pos in positions]
-    cog_row = np.mean(rows) # simple mean in rows
-    cog_col = np.mean(cols) # simple mean in cols
+    cog_row = np.mean(rows)
+    cog_col = np.mean(cols)
     return (float(cog_row), float(cog_col))
 
 # cost function for assignment: distance between cogs
-def cost_cog(traj_new, traj_GT):
+def cost_cog(traj_new, traj_GT, invalid_cost=np.inf):
     cog_new = cog(traj_new)
     cog_GT = cog(traj_GT)
+
+    if cog_new is None or cog_GT is None:
+        return invalid_cost
+
     return np.linalg.norm(np.array(cog_new) - np.array(cog_GT))
 
 # definition of the cost matrix
-def compute_cost_matrix(trajectories_new, trajectories_GT):
+def compute_cost_matrix(trajectories_new, trajectories_GT, cost_function=None):
+    if cost_function is None:
+        cost_function = mean_position_distance_on_overlap
+
     cost_matrix = np.zeros((len(trajectories_new), len(trajectories_GT)))
     for i, traj_new in enumerate(trajectories_new):
         for j, traj_GT in enumerate(trajectories_GT):
-            cost_matrix[i, j] = cost_cog(traj_new, traj_GT)
+            cost_matrix[i, j] = cost_function(traj_new, traj_GT)
     return cost_matrix
 
+# ------------------------- Check for temporal overlap of trajectories -------------------------
+# check if two trajectories overlap in time
+def trajectories_overlap_in_time(traj1, traj2): 
+    return not (traj1.end_frame < traj2.start_frame or traj2.end_frame < traj1.start_frame)
+
+# check the interval of frames where two trajectories overlap in time; return None if they do not overlap
+def overlap_interval(traj1, traj2): # 
+    start = max(traj1.start_frame, traj2.start_frame)
+    end = min(traj1.end_frame, traj2.end_frame)
+    if start > end:
+        return None
+    return start, end
+
+# cost function that only considers the distance between cogs if the trajectories overlap in time, otherwise returns a large cost
+def cost_cog_overlap_only(traj_new, traj_GT, invalid_cost=1e6):
+    if not trajectories_overlap_in_time(traj_new, traj_GT):
+        return invalid_cost
+    return cost_cog(traj_new, traj_GT, invalid_cost=invalid_cost)
+
+# cost function that computes the mean distance between positions of two trajectories on their temporal overlap; if no overlap, returns a large cost
+def mean_position_distance_on_overlap(traj1, traj2, invalid_cost=1e6): 
+    interval = overlap_interval(traj1, traj2)
+    if interval is None:
+        return invalid_cost
+
+    start, end = interval
+    distances = []
+
+    for f in range(start, end + 1):
+        p1 = traj1.get_position_at_frame(f)
+        p2 = traj2.get_position_at_frame(f)
+
+        if p1 is None or p2 is None:
+            continue
+
+        distances.append(np.linalg.norm(np.array(p1) - np.array(p2)))
+
+    if len(distances) == 0:
+        return invalid_cost
+
+    return float(np.mean(distances))
+
+# ------------------------- Relabel trajectories according to assignment -------------------------
 def relabel_from_assignment(trajectories_new, trajectories_GT, assignment):
     for i, traj in enumerate(trajectories_new):
         traj.id = assignment[i] # assign all trajectories according to the assignment; if no assignment was made, traj.id will be -1
@@ -232,9 +295,61 @@ def relabel_from_assignment(trajectories_new, trajectories_GT, assignment):
             traj.color = trajectories_GT[traj.id].color # assigned trajectories take the color of the GT trajectory they are assigned to
     return trajectories_new
 
-def assign_trajectories(trajectories_new, trajectories_GT, algorithm='hungarian', verbose=False):
+# def assign_trajectories(trajectories_new, trajectories_GT, algorithm='hungarian', verbose=False):
  
-    cost = compute_cost_matrix(trajectories_new, trajectories_GT)
+#     cost = compute_cost_matrix(trajectories_new, trajectories_GT)
+
+#     if verbose:
+#         print("Cost matrix:")
+#         print(cost)
+
+#     if verbose:
+#         print('Computing assignment using algorithm:', algorithm)
+#     if algorithm == 'hungarian':
+#         min_cost, assignment = hungarian(cost)
+#     elif algorithm == 'hungarian_pypi':
+#         min_cost, assignment = hungarian_pypi(cost)
+#     elif algorithm == 'local_nn':
+#         min_cost, assignment = local_nn_assignment(cost)
+#     elif algorithm == 'global_nn':
+#         min_cost, assignment = global_nn_assignment(cost)
+#     else:
+#         raise ValueError("Invalid algorithm specified. Choose 'hungarian', 'hungarian_pypi', 'local_nn', or 'global_nn'.")
+
+#     if verbose:
+#         print_assignment(assignment)
+
+#     trajectories_new = relabel_from_assignment(trajectories_new, trajectories_GT, assignment)
+
+#     if verbose:
+#         for traj in trajectories_new:
+#             relabelled_count = 0
+#             if traj.id != -1 and traj.id is not None:
+#                 relabelled_count += 1
+#             print(f"Trajectory ID: {traj.id}, Number of positions: {len(traj.get_positions())}, Relabelled: {'Yes' if traj.id != -1 and traj.id is not None else 'No'}")
+    
+#     return trajectories_new, min_cost, assignment
+
+def assign_trajectories(
+    trajectories_new,
+    trajectories_GT,
+    algorithm='hungarian',
+    cost_function=None,
+    verbose=False
+):
+    """Assign trajectories from trajectories_new to trajectories_GT based on the specified algorithm and cost function.
+    Args:
+         trajectories_new: list of trajectories to be assigned
+         trajectories_GT: list of ground truth trajectories to assign to
+         algorithm: assignment algorithm to use ('hungarian', 'hungarian_pypi', 'local_nn', 'global_nn')
+         cost_function: cost function to compute the cost matrix; if None, defaults to mean_position_distance_on_overlap
+         verbose: if True, print detailed information about the cost matrix and assignment process
+    Returns:
+         trajectories_new: list of trajectories with updated IDs according to the assignment
+         min_cost: the minimum cost of the assignment
+         assignment: list where assignment[i] is the index of the trajectory in trajectories_GT assigned to trajectories_new[i], or -1 if no assignment was made
+    """
+    cost = compute_cost_matrix(trajectories_new, trajectories_GT, cost_function=cost_function)
 
     if verbose:
         print("Cost matrix:")
@@ -242,6 +357,7 @@ def assign_trajectories(trajectories_new, trajectories_GT, algorithm='hungarian'
 
     if verbose:
         print('Computing assignment using algorithm:', algorithm)
+
     if algorithm == 'hungarian':
         min_cost, assignment = hungarian(cost)
     elif algorithm == 'hungarian_pypi':
@@ -259,15 +375,86 @@ def assign_trajectories(trajectories_new, trajectories_GT, algorithm='hungarian'
     trajectories_new = relabel_from_assignment(trajectories_new, trajectories_GT, assignment)
 
     if verbose:
+        relabelled_count = 0
         for traj in trajectories_new:
-            relabelled_count = 0
-            if traj.id != -1 and traj.id is not None:
+            was_relabelled = traj.id != -1 and traj.id is not None
+            if was_relabelled:
                 relabelled_count += 1
-            print(f"Trajectory ID: {traj.id}, Number of positions: {len(traj.get_positions())}, Relabelled: {'Yes' if traj.id != -1 and traj.id is not None else 'No'}")
-    
+            print(
+                f"Trajectory ID: {traj.id}, "
+                f"Frames: {traj.start_frame}->{traj.end_frame}, "
+                f"Number of positions: {len(traj.get_positions())}, "
+                f"Relabelled: {'Yes' if was_relabelled else 'No'}"
+            )
+
     return trajectories_new, min_cost, assignment
 
 def print_assignment(assignment):
     """"Print in the form of two columns with arrows in between, to visualize the assignment of trajectories."""
     for i, assigned_id in enumerate(assignment):
         print(f"{i} -> {assigned_id}")
+
+def print_assignment_verbose(trajectories_new, trajectories_GT, assignment):
+    for i, assigned_id in enumerate(assignment):
+        new_traj = trajectories_new[i]
+        if assigned_id == -1:
+            print(
+                f"new[{i}] ({new_traj.start_frame}->{new_traj.end_frame}) -> unassigned"
+            )
+        else:
+            gt_traj = trajectories_GT[assigned_id]
+            print(
+                f"new[{i}] ({new_traj.start_frame}->{new_traj.end_frame}) "
+                f"-> gt[{assigned_id}] ({gt_traj.start_frame}->{gt_traj.end_frame})"
+            )
+    
+def assign_d_l_trajectories(trajectories_detection, trajectories_localization, trajectories_GT, verbose=False):
+    # assignment
+    traj_det, cost_det, assignment_det = assign_trajectories(trajectories_detection, trajectories_GT)
+    traj_loc, cost_loc, assignment_loc = assign_trajectories(trajectories_localization, trajectories_GT)
+
+    if verbose:
+        print("Detection assignment:")
+        print_assignment_verbose(traj_det, trajectories_GT, assignment_det)
+        print("\nLocalization assignment:")
+        print_assignment_verbose(traj_loc, trajectories_GT, assignment_loc)
+
+    return traj_det, cost_det, assignment_det, traj_loc, cost_loc, assignment_loc
+
+
+    # ---- OLD ------
+def label_trajectories_from_GT(trajectories_new, trajectories_GT, max_distance=10):
+    used_GT_idx = []
+
+    for traj in trajectories_new:
+        cog_traj = cog(traj)
+        if cog_traj is None:
+            traj.id = None
+            continue
+
+        distances = []
+        for gt_traj in trajectories_GT:
+            if not trajectories_overlap_in_time(traj, gt_traj): # if trajectories do not overlap in time, they cannot correspond to the same particle
+                continue
+
+            cog_gt = cog(gt_traj)
+            if cog_gt is None:
+                distances.append(np.inf)
+                continue
+
+            distances.append(np.linalg.norm(np.array(cog_traj) - np.array(cog_gt)))
+
+        for idx in used_GT_idx:
+            distances[idx] = np.inf
+
+        closest_GT_idx = np.argmin(distances)
+        if distances[closest_GT_idx] > max_distance:
+            traj.set_id(None)
+            print('No GT trajectory within max distance for', cog_traj, '-> id None')
+        else:
+            traj.set_id(trajectories_GT[closest_GT_idx].id)
+            traj.color = trajectories_GT[closest_GT_idx].color
+            used_GT_idx.append(closest_GT_idx)
+            print('Assigned', cog_traj, 'to GT id', traj.id)
+
+

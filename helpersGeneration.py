@@ -13,11 +13,11 @@ def background(x,y):
 
 def background1(x,y):
     sigma = 0.5
-    return 100 * np.ones_like(x) +  5000 * (1/(2*np.pi*sigma**2)) * np.exp(-((x-0)**2 + (y-0)**2)/(2*sigma**2))
+    return 100 * np.ones_like(x) +  500 * (1/(2*np.pi*sigma**2)) * np.exp(-((x-0)**2 + (y-0)**2)/(2*sigma**2))
 
 def background2(x,y):
     sigma = 0.5
-    return 100 * np.ones_like(x) +  5000 * (1/(2*np.pi*sigma**2)) * np.exp(-((x-1)**2 + (y-1)**2)/(2*sigma**2))
+    return 100 * np.ones_like(x) +  500 * (1/(2*np.pi*sigma**2)) * np.exp(-((x-1)**2 + (y-1)**2)/(2*sigma**2))
 
 def background3(x, y, peak=1000, floor=100, theta_deg=35, offset=0.75, sigma=0.4):
     
@@ -357,13 +357,13 @@ def generate_frames_random(F, N, D = None, amp = 1000, noise_gaussian=False, noi
         end = traj.end_frame
 
         # crop start
-        if random.random() < 0.2:
+        if random.random() < 0.4:
             start_crop = random.randint(1, max(1, int(0.3 * L)))
             start += start_crop
             print(f"Trajectory {traj.id} cropped at start by {start_crop} frames")
 
         # crop end
-        if random.random() < 0.2:
+        if random.random() < 0.4:
             max_end_crop = max(1, int(0.3 * L))
             end_crop = random.randint(1, max_end_crop)
             end -= end_crop
@@ -589,7 +589,7 @@ def linear_trajectories_visualizer(trajectories_new, trajectories_GT):
     if all_ids:
         plt.ylim(-1, max(all_ids) + 1)
 
-    plt.title('Comparison of GT and New Trajectories')
+    plt.title('Comparison of GT and experimental trajectories')
     plt.legend()
     plt.grid()
     plt.show()

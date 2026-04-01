@@ -1,5 +1,6 @@
 import numpy as np
-from helpersGeneration import Particle, Trajectory
+from helpersGeneration import Trajectory
+from helpersAssignment import assign_trajectories, cog, cost_cog
 import matplotlib.pyplot as plt
 from skimage.feature import peak_local_max
 from scipy.optimize import curve_fit
@@ -8,30 +9,87 @@ from scipy.optimize import curve_fit
 
 # based on the detected peaks -> tracking algorithm to link the peaks across frames and reconstruct the trajectories of the particles as a list of Trajectories objects
 # chosen method = nearest neighbor algorithm (each peak linked to the closest peak in the next frame within a certain distance threshold)
+# def NN_tracking(peaks, max_distance=5):
+#     """
+#     peaks: list of arrays, one per frame
+#            each peaks[f] has shape (n_peaks_f, 2)
+#     max_distance: maximum allowed jump between consecutive frames
+
+#     Returns
+#     -------
+#     trajectories: list of Trajectory objects
+#     """
+#     if len(peaks) == 0 or len(peaks[0]) == 0: # if no peaks in first frame, cannot initialize any trajectory
+#         return []
+
+#     # initialize one trajectory per peak in first frame
+#     trajectories = []
+#     active = [] # indices of trajectories still being tracked
+
+#     for i, peak in enumerate(peaks[0]):
+#         traj = Trajectory(i)
+#         traj.add_position(peak)
+#         trajectories.append(traj)
+#         active.append(i)
+
+#     # process subsequent frames
+#     for f in range(1, len(peaks)):
+#         current_peaks = np.asarray(peaks[f])
+
+#         if len(current_peaks) == 0:
+#             active = []
+#             break
+
+#         used = np.zeros(len(current_peaks), dtype=bool)
+#         new_active = []
+
+#         for traj_idx in active:
+#             traj = trajectories[traj_idx]
+#             last_pos = np.array(traj.last_position())
+
+#             distances = np.linalg.norm(current_peaks - last_pos, axis=1)
+
+#             # ignore already assigned peaks
+#             distances[used] = np.inf
+
+#             min_idx = np.argmin(distances)
+#             min_dist = distances[min_idx]
+
+#             if min_dist <= max_distance:
+#                 traj.add_position(current_peaks[min_idx]) # add_position method of Trajectory class
+#                 used[min_idx] = True
+#                 new_active.append(traj_idx)
+#             # else: trajectory ends here
+
+#         active = new_active
+
+#         if len(active) == 0:
+#             break
+
+#     return trajectories
+
 def NN_tracking(peaks, max_distance=5):
     """
     peaks: list of arrays, one per frame
            each peaks[f] has shape (n_peaks_f, 2)
-    max_distance: maximum allowed jump between consecutive frames
 
     Returns
     -------
     trajectories: list of Trajectory objects
     """
-    if len(peaks) == 0 or len(peaks[0]) == 0: # if no peaks in first frame, cannot initialize any trajectory
+    if len(peaks) == 0 or len(peaks[0]) == 0:
         return []
 
-    # initialize one trajectory per peak in first frame
     trajectories = []
-    active = [] # indices of trajectories still being tracked
+    active = []
 
+    # initialize from frame 0
     for i, peak in enumerate(peaks[0]):
-        traj = Trajectory(i)
-        traj.add_position(peak)
+        traj = Trajectory(i, start_frame=0)
+        traj.add_position(peak, frame=0)
         trajectories.append(traj)
         active.append(i)
 
-    # process subsequent frames
     for f in range(1, len(peaks)):
         current_peaks = np.asarray(peaks[f])
 
@@ -47,18 +105,15 @@ def NN_tracking(peaks, max_distance=5):
             last_pos = np.array(traj.last_position())
 
             distances = np.linalg.norm(current_peaks - last_pos, axis=1)
-
-            # ignore already assigned peaks
             distances[used] = np.inf
 
             min_idx = np.argmin(distances)
             min_dist = distances[min_idx]
 
             if min_dist <= max_distance:
-                traj.add_position(current_peaks[min_idx]) # add_position method of Trajectory class
+                traj.add_position(current_peaks[min_idx], frame=f)
                 used[min_idx] = True
                 new_active.append(traj_idx)
-            # else: trajectory ends here
 
         active = new_active
 
@@ -67,57 +122,111 @@ def NN_tracking(peaks, max_distance=5):
 
     return trajectories
 
-def NN_tracking_enchanced(peaks, max_distance=5):
+# def NN_tracking_enchanced(peaks, max_distance=5):
+#     """
+#     Enhanced version that allows to pick up trajectories that do not start from the first frame, 
+#     by also initializing new trajectories from unassigned peaks in each frame.
+#     """
+#     if len(peaks) == 0: # if no peaks at all, cannot initialize any trajectory
+#         return []
+    
+#     trajectories = [] # list of trajectory indices that are still alive
+#     active = []
+    
+#     for f in range(len(peaks)): # for each frame
+#         current_peaks = np.asarray(peaks[f]) # convert to numpy array for easier distance calculations
+    
+#         if len(current_peaks) == 0: # if no peaks in current frame, all active trajectories end here
+#             active = []
+#             continue
+    
+#         used = np.zeros(len(current_peaks), dtype=bool)
+#         new_active = []
+    
+#         # first try to link existing trajectories
+#         for traj_idx in active: # for all active trajectories
+#             traj = trajectories[traj_idx]
+#             last_pos = np.array(traj.last_position()) # get last position of trajectory as numpy array
+    
+#             distances = np.linalg.norm(current_peaks - last_pos, axis=1) # compute distances to all peaks in current frame
+#             distances[used] = np.inf # ignore already assigned peaks by setting their distance to infinity
+    
+#             min_idx = np.argmin(distances) # find index of closest peak
+#             min_dist = distances[min_idx] # get distance to closest peak
+    
+#             if min_dist <= max_distance: # distance criterion for linking
+#                 traj.add_position(current_peaks[min_idx]) # add peak to trajectory
+#                 used[min_idx] = True # mark this peak as used
+#                 new_active.append(traj_idx) # keep trajectory active for next frame
+    
+#         # then initialize new trajectories from unassigned peaks
+#         for i, peak in enumerate(current_peaks):
+#             if not used[i]: # for all unused peaks
+#                 traj_id = len(trajectories) # new trajectory id is next available index
+#                 traj = Trajectory(traj_id) # create new trajectory
+#                 traj.add_position(peak) # add peak as first position
+#                 trajectories.append(traj) # add to list of trajectories
+#                 new_active.append(traj_id) # mark new trajectory as active
+    
+#         active = new_active # update active trajectories for next frame
+    
+#     # discard trajectories that have only one position (could be noise)
+#     trajectories = [traj for traj in trajectories if len(traj.get_positions()) > 1]
+    
+#     return trajectories
+
+def NN_tracking_enhanced(peaks, max_distance=5, min_length=2):
     """
-    Enhanced version that allows to pick up trajectories that do not start from the first frame, 
-    by also initializing new trajectories from unassigned peaks in each frame.
+    Enhanced NN tracking:
+    - links peaks across consecutive frames
+    - allows new trajectories to start at any frame
+    - trajectories end automatically when no match is found
     """
-    if len(peaks) == 0: # if no peaks at all, cannot initialize any trajectory
+    if len(peaks) == 0:
         return []
-    
-    trajectories = [] # list of trajectory indices that are still alive
+
+    trajectories = []
     active = []
-    
-    for f in range(len(peaks)): # for each frame
-        current_peaks = np.asarray(peaks[f]) # convert to numpy array for easier distance calculations
-    
-        if len(current_peaks) == 0: # if no peaks in current frame, all active trajectories end here
+
+    for f in range(len(peaks)):
+        current_peaks = np.asarray(peaks[f])
+
+        if len(current_peaks) == 0:
             active = []
             continue
-    
+
         used = np.zeros(len(current_peaks), dtype=bool)
         new_active = []
-    
-        # first try to link existing trajectories
-        for traj_idx in active: # for all active trajectories
+
+        # link existing trajectories
+        for traj_idx in active:
             traj = trajectories[traj_idx]
-            last_pos = np.array(traj.last_position()) # get last position of trajectory as numpy array
-    
-            distances = np.linalg.norm(current_peaks - last_pos, axis=1) # compute distances to all peaks in current frame
-            distances[used] = np.inf # ignore already assigned peaks by setting their distance to infinity
-    
-            min_idx = np.argmin(distances) # find index of closest peak
-            min_dist = distances[min_idx] # get distance to closest peak
-    
-            if min_dist <= max_distance: # distance criterion for linking
-                traj.add_position(current_peaks[min_idx]) # add peak to trajectory
-                used[min_idx] = True # mark this peak as used
-                new_active.append(traj_idx) # keep trajectory active for next frame
-    
-        # then initialize new trajectories from unassigned peaks
+            last_pos = np.array(traj.last_position())
+
+            distances = np.linalg.norm(current_peaks - last_pos, axis=1)
+            distances[used] = np.inf
+
+            min_idx = np.argmin(distances)
+            min_dist = distances[min_idx]
+
+            if min_dist <= max_distance:
+                traj.add_position(current_peaks[min_idx], frame=f)
+                used[min_idx] = True
+                new_active.append(traj_idx)
+
+        # initialize new trajectories from unassigned peaks
         for i, peak in enumerate(current_peaks):
-            if not used[i]: # for all unused peaks
+            if not used[i]:
                 traj_id = len(trajectories) # new trajectory id is next available index
-                traj = Trajectory(traj_id) # create new trajectory
-                traj.add_position(peak) # add peak as first position
-                trajectories.append(traj) # add to list of trajectories
-                new_active.append(traj_id) # mark new trajectory as active
-    
-        active = new_active # update active trajectories for next frame
-    
-    # discard trajectories that have only one position (could be noise)
-    trajectories = [traj for traj in trajectories if len(traj.get_positions()) > 1]
-    
+                traj = Trajectory(traj_id, start_frame=f) # create new trajectory with start frame
+                traj.add_position(peak, frame=f) # add peak as first position with frame info
+                trajectories.append(traj)
+                new_active.append(traj_id)
+
+        active = new_active
+
+    trajectories = [traj for traj in trajectories if traj.length() >= min_length] # keep only trajectories with at least min_length positions
+
     return trajectories
 
 
@@ -149,27 +258,29 @@ def cog(trajectory):
     cog_col = np.mean(cols) # simple mean in cols
     return (float(cog_row), float(cog_col))
 
-# nearest neighbor association between detected and GT trajectories, label detected trajectories with closest GT id
-def label_trajectories_from_GT(trajectories_new, trajectories_GT, max_distance=10):
-    cog_GT = [cog(traj) for traj in trajectories_GT]
-    used_GT_idx = []
-    for traj in trajectories_new:
-        cog_traj = cog(traj)
-        if cog_traj is None:
-            traj.id = None
-            continue
-        distances = [np.linalg.norm(np.array(cog_traj) - np.array(cog_gt)) for cog_gt in cog_GT]
-        for idx in used_GT_idx:
-            distances[idx] = np.inf # to prevent multiple assignments of the same GT trajectory
-        closest_GT_idx = np.argmin(distances)
-        if distances[closest_GT_idx] > max_distance:
-            traj.set_id(None)
-            print('No GT cog within max distance for', cog_traj, '-> id None')
-        else:
-            traj.set_id(trajectories_GT[closest_GT_idx].id)
-            used_GT_idx.append(closest_GT_idx)
-            print('Assigned', cog_traj, 'to GT', cog_GT[closest_GT_idx], '-> id', traj.id)
+def trajectories_overlap_in_time(traj1, traj2):
+    return not (traj1.end_frame < traj2.start_frame or traj2.end_frame < traj1.start_frame)
 
+# nearest neighbor association between detected and GT trajectories, label detected trajectories with closest GT id
+# def label_trajectories_from_GT(trajectories_new, trajectories_GT, max_distance=10):
+#     cog_GT = [cog(traj) for traj in trajectories_GT]
+#     used_GT_idx = []
+#     for traj in trajectories_new:
+#         cog_traj = cog(traj)
+#         if cog_traj is None:
+#             traj.id = None
+#             continue
+#         distances = [np.linalg.norm(np.array(cog_traj) - np.array(cog_gt)) for cog_gt in cog_GT]
+#         for idx in used_GT_idx:
+#             distances[idx] = np.inf # to prevent multiple assignments of the same GT trajectory
+#         closest_GT_idx = np.argmin(distances)
+#         if distances[closest_GT_idx] > max_distance:
+#             traj.set_id(None)
+#             print('No GT cog within max distance for', cog_traj, '-> id None')
+#         else:
+#             traj.set_id(trajectories_GT[closest_GT_idx].id)
+#             used_GT_idx.append(closest_GT_idx)
+#             print('Assigned', cog_traj, 'to GT', cog_GT[closest_GT_idx], '-> id', traj.id)
 
 # ----- LOCALIZATION -----
 def amp(sigma, A):
@@ -257,15 +368,57 @@ def localize_peaks_with_gaussian_fitting(frames, detected_peaks, verbose=False, 
 
     return localized_peaks
 
+# def visualize_gaussian_fit(frame, peak, fitted_params):
+#     row, col = peak
+#     x0_fit, y0_fit, A_fit, sigma_fit, B_fit = fitted_params
+
+#     # --- Define zoom window (5x5 around fitted center) ---
+#     half = 2  # 2 pixels on each side → 5×5 window
+
+#     r0 = int(round(x0_fit))
+#     c0 = int(round(y0_fit))
+
+#     r_min = max(r0 - half, 0)
+#     r_max = min(r0 + half + 1, frame.shape[0])
+#     c_min = max(c0 - half, 0)
+#     c_max = min(c0 + half + 1, frame.shape[1])
+
+#     zoom = frame[r_min:r_max, c_min:c_max]
+
+#     # --- Plot ---
+#     plt.figure(figsize=(6, 6))
+#     plt.imshow(zoom, cmap='gray', extent=[c_min, c_max, r_max, r_min])
+
+#     # Detected peak (if inside zoom)
+#     if r_min <= row < r_max and c_min <= col < c_max:
+#         plt.scatter(col, row, c='r', marker='x', label='Detected Peak')
+
+#     # Fitted center
+#     plt.scatter(y0_fit, x0_fit, c='b', marker='o', label='Fitted Center')
+
+#     # --- Draw sigma-based circle ---
+#     k = 1.0  # 1-sigma radius; change to 2 or 3 if you want a larger outline
+#     radius = k * sigma_fit
+
+#     theta = np.linspace(0, 2*np.pi, 200)
+#     circle_x = y0_fit + radius * np.cos(theta)
+#     circle_y = x0_fit + radius * np.sin(theta)
+
+#     plt.plot(circle_x, circle_y, 'b--', linewidth=1.5, label=f'{k}σ circle')
+
+#     plt.title(f"Gaussian fit ({half*2+1}×{half*2+1} Zoom)")
+#     plt.legend()
+#     plt.tight_layout()
+#     plt.show()
+
 def visualize_gaussian_fit(frame, peak, fitted_params):
     row, col = peak
-    x0_fit, y0_fit, A_fit, sigma_fit, B_fit = fitted_params
+    row_fit, col_fit, A_fit, sigma_fit, B_fit = fitted_params
 
-    # --- Define zoom window (5x5 around fitted center) ---
-    half = 2  # 2 pixels on each side → 5×5 window
+    half = 2
 
-    r0 = int(round(x0_fit))
-    c0 = int(round(y0_fit))
+    r0 = int(round(row_fit))
+    c0 = int(round(col_fit))
 
     r_min = max(r0 - half, 0)
     r_max = min(r0 + half + 1, frame.shape[0])
@@ -274,26 +427,20 @@ def visualize_gaussian_fit(frame, peak, fitted_params):
 
     zoom = frame[r_min:r_max, c_min:c_max]
 
-    # --- Plot ---
     plt.figure(figsize=(6, 6))
     plt.imshow(zoom, cmap='gray', extent=[c_min, c_max, r_max, r_min])
 
-    # Detected peak (if inside zoom)
     if r_min <= row < r_max and c_min <= col < c_max:
         plt.scatter(col, row, c='r', marker='x', label='Detected Peak')
 
-    # Fitted center
-    plt.scatter(y0_fit, x0_fit, c='b', marker='o', label='Fitted Center')
+    plt.scatter(col_fit, row_fit, c='b', marker='o', label='Fitted Center')
 
-    # --- Draw sigma-based circle ---
-    k = 1.0  # 1-sigma radius; change to 2 or 3 if you want a larger outline
-    radius = k * sigma_fit
-
+    radius = sigma_fit
     theta = np.linspace(0, 2*np.pi, 200)
-    circle_x = y0_fit + radius * np.cos(theta)
-    circle_y = x0_fit + radius * np.sin(theta)
+    circle_x = col_fit + radius * np.cos(theta)
+    circle_y = row_fit + radius * np.sin(theta)
 
-    plt.plot(circle_x, circle_y, 'b--', linewidth=1.5, label=f'{k}σ circle')
+    plt.plot(circle_x, circle_y, 'b--', linewidth=1.5, label='1σ circle')
 
     plt.title(f"Gaussian fit ({half*2+1}×{half*2+1} Zoom)")
     plt.legend()
@@ -302,15 +449,12 @@ def visualize_gaussian_fit(frame, peak, fitted_params):
 
 
 
-
-
 # ----- EVALUATION OF DETECTION AND LOCALIZATION -----
 def compute_d_l_trajectories(frames, trajectories_GT, D_GT):
     # detection
     detected_peaks = detect_peaks(frames, threshold_abs=500, min_distance=1)
-    trajectories_detection = NN_tracking(detected_peaks, max_distance=5)
-    # localization
+    trajectories_detection = NN_tracking_enhanced(detected_peaks, max_distance=5) # allows to pick up trajectories that do not start from the first frame
     localized_peaks = localize_peaks_with_gaussian_fitting(frames, detected_peaks, verbose=True, visualization=True)
-    trajectories_localization = NN_tracking(localized_peaks, max_distance=5)
+    trajectories_localization = NN_tracking_enhanced(localized_peaks, max_distance=5)
 
     return trajectories_detection, trajectories_localization

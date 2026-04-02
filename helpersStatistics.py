@@ -526,9 +526,9 @@ def plot_mae_comparison(MAE_local, MAE_global, MAE_hungarian, D_type="Detection"
     plt.tight_layout()
     plt.show()
     
-def compute_Ds_setD(F, N, D):
+def compute_Ds_setD(F, N, D, amp=1000):
 
-    frames, trajectories_GT, D_GT = generate_frames_setD(F, N, D)
+    frames, trajectories_GT, D_GT = generate_frames_setD(F, N, D, amp=amp)
 
     # traj_GT
     D_trajectory = compute_D_trajectory(trajectories_GT, D_GT)

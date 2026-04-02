@@ -408,9 +408,9 @@ def print_assignment_verbose(trajectories_new, trajectories_GT, assignment):
                 f"-> gt[{assigned_id}] ({gt_traj.start_frame}->{gt_traj.end_frame})"
             )
     
-def assign_d_l_trajectories(trajectories_detection, trajectories_localization, trajectories_GT, verbose=False):
+def assign_d_l_trajectories(trajectories_detection, trajectories_localization, trajectories_GT, algorithm='hungarian', verbose=False):
     # assignment
-    traj_det, cost_det, assignment_det = assign_trajectories(trajectories_detection, trajectories_GT)
+    traj_det, cost_det, assignment_det = assign_trajectories(trajectories_detection, trajectories_GT, algorithm=algorithm)
     traj_loc, cost_loc, assignment_loc = assign_trajectories(trajectories_localization, trajectories_GT)
 
     if verbose:

@@ -1,8 +1,7 @@
 import numpy as np
-from helpersGeneration import Trajectory
-from helpersAssignment import *
-from helpersAssignment import assign_trajectories, cog, cost_cog
 import matplotlib.pyplot as plt
+from helpers.helpersGeneration import Trajectory
+from helpers.helpersAssignment import *
 from skimage.feature import peak_local_max
 from scipy.optimize import curve_fit
 
@@ -363,12 +362,6 @@ def fit_gaussian_to_peak(frame, peak, verbose=False):
     row_fit_img = (row - 2) + y0_fit
     col_fit_img = (col - 2) + x0_fit
 
-    if verbose:
-        print(
-            f"[Frame {frame}] Fitted center for peak at ({row}, {col}): "
-            f"({row_fit_img:.2f}, {col_fit_img:.2f}), amplitude {A_fit/(2 * np.pi * sigma_fit**2):.2f}, sigma {sigma_fit:.2f}"
-        )
-
     # compute goodness-of-fit metrics
     yfit = gaussian_2d((x_data, y_data), *popt).reshape(patch.shape)
     residuals = patch - yfit
@@ -402,18 +395,20 @@ def localize_peaks_with_gaussian_fitting(frames, detected_peaks, r_squared_thres
 
             if localized_peak is not None and r_squared is not None and r_squared >= r_squared_threshold:
                 localized_frame_peaks.append(localized_peak)
+                print(
+                    f"[Frame {frame_idx}] Fitted center for peak at ({peak[0]}, {peak[1]}): "
+                    f"({pos_fit[0]:.2f}, {pos_fit[1]:.2f}), amplitude {A_fit/(2 * np.pi * sigma_fit**2):.2f}, sigma {sigma_fit:.2f}"
+                )
             elif r_squared is None:
-                print('No computed R-squared for peak at ({}, {}) in frame {}.'.format(peak[0], peak[1], frame_idx))
+                print('[Frame {}] No computed R-squared for peak at ({}, {}) in frame {}.'.format(frame_idx, peak[0], peak[1], frame_idx))
             elif r_squared < r_squared_threshold:
-                print('Poor fit for peak at ({}, {}) in frame {}: R-squared = {:.3f} (below threshold of {}).'.format(peak[0], peak[1], frame_idx, r_squared, r_squared_threshold))
+                print('[Frame {}] Poor fit for peak at ({}, {}) in frame {}: R-squared = {:.3f} (below threshold of {}).'.format(frame_idx, peak[0], peak[1], frame_idx, r_squared, r_squared_threshold))
 
             # visualize only the first peak of the first frame
             if visualization and frame_idx == 0 and peak_idx == visualization_peak_idx and fitted is not None:
                 visualize_gaussian_fit(frame, peak, fitted)
 
         localized_peaks.append(localized_frame_peaks)
-
-
 
     return localized_peaks
 

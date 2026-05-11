@@ -1,5 +1,4 @@
 import numpy as np
-import sys
 from hungarian_algorithm import algorithm
 
 # ------------------------ Assignment algorithms -------------------------

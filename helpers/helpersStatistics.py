@@ -1,9 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import math
-from helpersGeneration import Trajectory
-from helpersTracking import NN_tracking, detect_peaks, localize_peaks_with_gaussian_fitting
-from helpersAssignment import assign_trajectories
 from scipy.optimize import curve_fit
 
 # ----- MSD EXTRACTION -----

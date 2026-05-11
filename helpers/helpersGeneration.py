@@ -2,6 +2,7 @@ import numpy as np
 import random
 import matplotlib.pyplot as plt
 import stackview
+import copy
 from skimage.measure import block_reduce
 
 
@@ -215,7 +216,7 @@ def simulate_brownian_motion(
     dt,
     startAtZero=False,
     boundary_margin=10,
-    bg_size=(128, 128),
+    frame_size=(128, 128),
     intensity_mean=1000,
     intensity_std=50,
     sigma_mean=1.0,
@@ -241,7 +242,7 @@ def simulate_brownian_motion(
         If True, all trajectories start at (0, 0). If False, they start at random positions within the field of view.
     boundary_margin : float
         If startAtZero is False, this margin ensures that initial positions are not too close to the border of the field of view.
-    bg_size : tuple
+    frame_size : tuple
         Size of the field of view in pixels (width, height). Used to determine random starting positions if startAtZero is False.
     intensity_mean : float
         Mean intensity for the simulated particles (used when adding intensity to Trajectory).
@@ -286,8 +287,8 @@ def simulate_brownian_motion(
         if startAtZero:
             positions[0] = [0.0, 0.0]
         else:
-            start_x = np.random.uniform(boundary_margin, bg_size[0] - boundary_margin)
-            start_y = np.random.uniform(boundary_margin, bg_size[1] - boundary_margin)
+            start_x = np.random.uniform(boundary_margin, frame_size[0] - boundary_margin)
+            start_y = np.random.uniform(boundary_margin, frame_size[1] - boundary_margin)
             positions += np.array([start_x, start_y])
 
         traj = Trajectory(
@@ -312,6 +313,16 @@ def simulate_brownian_motion(
         trajectories.append(traj)
 
     return trajectories
+
+# create trajectories_GT, the upsampled version of trajectories for comparison with detected and localized trajectories
+# current trajectories are of length nframes * nposframe, but we want to compare with trajectories at frame resolution (nframes)
+def create_GT_trajectories(trajectories, nposframe):
+    trajectories_GT = copy.deepcopy(trajectories)
+    for traj in trajectories_GT:
+        traj.positions = traj.positions[::nposframe]
+        traj.positions = [(128-pos[1], pos[0]) for pos in traj.positions]
+        traj.end_frame = traj.start_frame + len(traj.positions) - 1
+    return trajectories_GT
 
 def trajectories_to_global_video(trajectories, nframes, nPosPerFrame, image_props=None):
     """

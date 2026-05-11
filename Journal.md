@@ -195,3 +195,20 @@ Doute sur bruit :
 - enhanced stack experiment -> run ce soir? 
 - notes pour la suite
 - gap handling
+
+--- 
+# Semaine 7
+- added **blinking**: keep following motion and make disappear for 1-2 frames, then reappear, better than stopping motion to mimic what's seen on microscopy data.
+Added visible attribute to particles, render only visible particles. Also added a certain number of remaining blinking frames (somewhere between 1-2 frames for now).
+- by checking real data : je ne vois pas d'autre solution que denoising = capture noise + remove it
+- started taking a look at **denoisising techniques**:
+    1) Spectral (DL-based): https://pubs.rsc.org/en/content/articlehtml/2024/nr/d3nr05870k
+    2) Multistep: 
+    - a Voronoi Tessellation-based method ->  to remove free non-polymer localization points 
+    - G-means algorithm -> generate a group of clusters with centers. Features of the clusters are counted, which are passed to the LOF and DBSCAN algorithms as parameters.
+    - Local Outlier Factor (LOF) -> remove non-polymer localization points near the sample signal area.
+    - DBSCAN -> eliminate non-specific localization clusters 
+
+
+# Post-blek
+1) turn cost function into class

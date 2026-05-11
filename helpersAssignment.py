@@ -209,7 +209,7 @@ def hungarian_pypi(cost):
 #     cog_col = np.mean(cols) # simple mean in cols
 #     return (float(cog_row), float(cog_col))
 
-# ------------------------- Cost function and cost matrix for assignment -------------------------
+# ------------------------- Cost functions and cost matrix for assignment -------------------------
 def cog(trajectory):
     positions = trajectory.get_positions()
     if len(positions) == 0:
@@ -231,8 +231,47 @@ def cost_cog(traj_new, traj_GT, invalid_cost=np.inf):
 
     return np.linalg.norm(np.array(cog_new) - np.array(cog_GT))
 
+# old
+# def cost_particles_frame2frame(
+#     trajectory,
+#     detection,
+#     distance=True,
+#     intensity=True,
+#     sigma=True,
+#     lambda1=0.5,
+#     lambda2=0.4,
+#     lambda3=0.1,
+# ):
+#     pos, det_intensity, det_sigma = detection
+
+#     cost = 0.0
+
+#     if distance:
+#         dist = np.linalg.norm(np.array(trajectory.last_position()) - np.array(pos))
+#         dist_norm = 0.25 * 128
+#         cost += lambda1 * (dist / dist_norm)
+#         print(f'Dist cost: {lambda1 * (dist / dist_norm)}')
+
+#     if intensity:
+#         last_intensity = trajectory.last_intensity()
+#         if last_intensity is not None and det_intensity is not None:
+#             intensity_diff = abs(last_intensity - det_intensity)
+#             intensity_norm = 650
+#             cost += lambda2 * (intensity_diff / intensity_norm)
+#             print(f'Intensity cost: {lambda2 * (intensity_diff / intensity_norm)}')
+
+#     if sigma:
+#         last_sigma = trajectory.last_sigma()
+#         if last_sigma is not None and det_sigma is not None:
+#             sigma_diff = abs(last_sigma - det_sigma)
+#             sigma_norm = 2.0
+#             cost += lambda3 * (sigma_diff / sigma_norm)
+#             print(f'Sigma cost: {lambda3 * (sigma_diff / sigma_norm)}')
+
+#     return cost
+
 # definition of the cost matrix
-def compute_cost_matrix(trajectories_new, trajectories_GT, cost_function=None):
+def compute_cost_matrix_trajectories(trajectories_new, trajectories_GT, cost_function=None):
     if cost_function is None:
         cost_function = mean_position_distance_on_overlap
 
@@ -241,6 +280,81 @@ def compute_cost_matrix(trajectories_new, trajectories_GT, cost_function=None):
         for j, traj_GT in enumerate(trajectories_GT):
             cost_matrix[i, j] = cost_function(traj_new, traj_GT)
     return cost_matrix
+
+def compute_cost_matrix_p2p(peaks_f1, peaks_f2, distance=True, intensity_diff=False, sigma_diff=False):
+    cost_matrix = np.zeros((len(peaks_f1), len(peaks_f2)))
+    for i, peak1 in enumerate(peaks_f1):
+        for j, peak2 in enumerate(peaks_f2):
+            cost = 0
+            if distance:
+                cost += np.linalg.norm(np.array(peak1[:2]) - np.array(peak2[:2]))
+            if intensity_diff:
+                # TO DO
+                continue
+            if sigma_diff:
+                # TO DO
+                continue
+            cost_matrix[i, j] = cost
+    return cost_matrix
+
+def compute_cost_matrix_tracks_to_detections(
+    active_trajectories,
+    current_detections,
+    cost_function=None,
+    max_distance=None,
+    invalid_cost=1e6,
+):
+    """
+    Rows = active trajectories
+    Cols = current detections
+
+    Each detection is expected to be normalized as:
+
+        (pos, intensity, sigma)
+
+    where:
+
+        pos = (x, y) or (x, y, z)
+
+    Spatial gating is always done using raw Euclidean distance.
+
+    `cost_function` should be callable:
+
+        cost = cost_function(trajectory, detection)
+    """
+
+    if cost_function is None:
+        cost_function = PeakToPeak.default()
+
+    cost_matrix = np.full(
+        (len(active_trajectories), len(current_detections)),
+        invalid_cost,
+        dtype=float,
+    )
+
+    for i, traj in enumerate(active_trajectories):
+        last_pos = np.asarray(traj.last_position(), dtype=float)
+
+        for j, det in enumerate(current_detections):
+            pos = np.asarray(det[0], dtype=float)
+
+            spatial_dist = np.linalg.norm(last_pos - pos)
+
+            if max_distance is not None and spatial_dist > max_distance:
+                continue
+
+            cost = cost_function(traj, det)
+
+            if isinstance(cost, tuple):
+                cost = cost[0]
+
+            if torch.is_tensor(cost):
+                cost = cost.detach().cpu().item()
+
+            cost_matrix[i, j] = float(cost)
+
+    return cost_matrix
+
 
 # ------------------------- Check for temporal overlap of trajectories -------------------------
 # check if two trajectories overlap in time
@@ -349,7 +463,7 @@ def assign_trajectories(
          min_cost: the minimum cost of the assignment
          assignment: list where assignment[i] is the index of the trajectory in trajectories_GT assigned to trajectories_new[i], or -1 if no assignment was made
     """
-    cost = compute_cost_matrix(trajectories_new, trajectories_GT, cost_function=cost_function)
+    cost = compute_cost_matrix_trajectories(trajectories_new, trajectories_GT, cost_function=cost_function)
 
     if verbose:
         print("Cost matrix:")
@@ -457,4 +571,106 @@ def label_trajectories_from_GT(trajectories_new, trajectories_GT, max_distance=1
             used_GT_idx.append(closest_GT_idx)
             print('Assigned', cog_traj, 'to GT id', traj.id)
 
+# ------- DEFINE CUSTOM COST FUNCTIONS FOR PARTICLE-TO-PARTICLE ASSIGNMENT AND TRAJECTORY-TO-TRAJECTORY ASSIGNMENT -------
+import torch
+import torch.nn as nn
+
+
+class CostTerm(nn.Module):
+    def __init__(self, weight=1.0, norm=1.0, enabled=True):
+        super().__init__()
+        self.weight = weight
+        self.norm = norm
+        self.enabled = enabled
+
+    def forward(self, trajectory, detection):
+        raise NotImplementedError
+
+
+class DistanceTerm(CostTerm):
+    def forward(self, trajectory, detection):
+        if not self.enabled:
+            return torch.tensor(0.0)
+
+        pos, _, _ = detection
+
+        last_pos = torch.as_tensor(
+            trajectory.last_position(),
+            dtype=torch.float32,
+        )
+
+        pos = torch.as_tensor(pos, dtype=torch.float32)
+
+        dist = torch.linalg.norm(last_pos - pos)
+        return self.weight * (dist / self.norm)
+
+
+class IntensityTerm(CostTerm):
+    def forward(self, trajectory, detection):
+        if not self.enabled:
+            return torch.tensor(0.0)
+
+        _, det_intensity, _ = detection
+        last_intensity = trajectory.last_intensity()
+
+        if last_intensity is None or det_intensity is None:
+            return torch.tensor(0.0)
+
+        last_intensity = torch.as_tensor(last_intensity, dtype=torch.float32)
+        det_intensity = torch.as_tensor(det_intensity, dtype=torch.float32)
+
+        diff = torch.abs(last_intensity - det_intensity)
+        return self.weight * (diff / self.norm)
+
+
+class SigmaTerm(CostTerm):
+    def forward(self, trajectory, detection):
+        if not self.enabled:
+            return torch.tensor(0.0)
+
+        _, _, det_sigma = detection # ((x,y),int,sigma)
+        last_sigma = trajectory.last_sigma()
+
+        if last_sigma is None or det_sigma is None:
+            return torch.tensor(0.0)
+
+        last_sigma = torch.as_tensor(last_sigma, dtype=torch.float32)
+        det_sigma = torch.as_tensor(det_sigma, dtype=torch.float32)
+
+        diff = torch.abs(last_sigma - det_sigma)
+        return self.weight * (diff / self.norm)
+
+
+class PeakToPeak(nn.Module):
+    def __init__(self, terms=None, return_breakdown=False):
+        super().__init__()
+
+        if terms is None:
+            terms = {}
+
+        self.terms = nn.ModuleDict(terms)
+        self.return_breakdown = return_breakdown
+
+    @classmethod
+    def default(cls):
+        return cls(
+            terms={
+                "distance": DistanceTerm(weight=0.5, norm=0.25 * 128),
+                "intensity": IntensityTerm(weight=0.4, norm=650),
+                "sigma": SigmaTerm(weight=0.1, norm=2.0),
+            }
+        )
+
+    def forward(self, trajectory, detection):
+        costs = {
+            name: term(trajectory, detection)
+            for name, term in self.terms.items()
+        }
+
+        total = sum(costs.values())
+
+        if self.return_breakdown:
+            return total, costs
+
+        return total
 

@@ -1,14 +1,15 @@
 import numpy as np
 import random
 import matplotlib.pyplot as plt
-import stackview
+#import stackview
 import copy
 from skimage.measure import block_reduce
 
 
+
 class Trajectory:
     def __init__(self, id, initial_position=None, start_frame=0,
-             D_GT=None, D1_GT=None, D2_GT=None, theta_GT=None,
+             D1_ini=None, D2_ini=None, theta_ini=None,
              initial_intensity=None, initial_sigma=None):
     
         self.id = id
@@ -17,23 +18,12 @@ class Trajectory:
         self.sigmas = []
         self.color = (random.random(), random.random(), random.random())
 
-        self.msd = []
-
-        self.D1_GT = D1_GT
-        self.D2_GT = D2_GT
-        self.theta_GT = theta_GT
-
-        self.D1_trajectory = np.nan
-        self.D2_trajectory = np.nan
-        self.theta_trajectory = np.nan
-
-        self.D1_detection = np.nan
-        self.D2_detection = np.nan
-        self.theta_detection = np.nan
-
-        self.D1_localization = np.nan
-        self.D2_localization = np.nan
-        self.theta_localization = np.nan
+        # Diffusion parameters
+        self.MSD = []
+        self.D_tensor = None
+        self.D1 = D1_ini
+        self.D2 = D2_ini
+        self.theta = theta_ini
 
         self.start_frame = start_frame
         self.end_frame = start_frame - 1
@@ -68,38 +58,6 @@ class Trajectory:
         self.intensities.append(intensity)
         self.sigmas.append(sigma)
         self.end_frame = frame
-
-    # def add_intensity(self, intensity, frame=None):
-    #     """
-    #     Optional helper if you want to modify/store intensity separately,
-    #     but frame must already exist.
-    #     """
-    #     if frame is None:
-    #         if not self.positions:
-    #             raise ValueError("Cannot add intensity to empty trajectory")
-    #         frame = self.end_frame
-
-    #     if frame < self.start_frame or frame > self.end_frame:
-    #         raise ValueError(f"Frame {frame} outside trajectory span")
-
-    #     idx = frame - self.start_frame
-    #     self.intensities[idx] = intensity
-
-    # def add_sigma(self, sigma, frame=None):
-    #     """
-    #     Optional helper if you want to modify/store sigma separately,
-    #     but frame must already exist.
-    #     """
-    #     if frame is None:
-    #         if not self.positions:
-    #             raise ValueError("Cannot add sigma to empty trajectory")
-    #         frame = self.end_frame
-
-    #     if frame < self.start_frame or frame > self.end_frame:
-    #         raise ValueError(f"Frame {frame} outside trajectory span")
-
-    #     idx = frame - self.start_frame
-    #     self.sigmas[idx] = sigma
 
     def get_positions(self):
         return self.positions
@@ -294,9 +252,9 @@ def simulate_brownian_motion(
         traj = Trajectory(
             id=p,
             start_frame=0,
-            D1_GT=D1,
-            D2_GT=D2,
-            theta_GT=theta
+            D1_ini=D1,
+            D2_ini=D2,
+            theta_ini=theta
         )
 
         for t in range(num_steps):
@@ -313,16 +271,6 @@ def simulate_brownian_motion(
         trajectories.append(traj)
 
     return trajectories
-
-# create trajectories_GT, the upsampled version of trajectories for comparison with detected and localized trajectories
-# current trajectories are of length nframes * nposframe, but we want to compare with trajectories at frame resolution (nframes)
-def create_GT_trajectories(trajectories, nposframe):
-    trajectories_GT = copy.deepcopy(trajectories)
-    for traj in trajectories_GT:
-        traj.positions = traj.positions[::nposframe]
-        traj.positions = [(128-pos[1], pos[0]) for pos in traj.positions]
-        traj.end_frame = traj.start_frame + len(traj.positions) - 1
-    return trajectories_GT
 
 def trajectories_to_global_video(trajectories, nframes, nPosPerFrame, image_props=None):
     """
@@ -513,7 +461,36 @@ def show_trajectory(frames, trajectories, traj_id=0, frame_id=0, save_path=None)
 
     plt.show()
 
-def show_trajectories(frames, trajectories, frame_id=0, title=None, save_path=None):
+# def show_trajectories(frames, trajectories, frame_id=0, title=None, save_path=None):
+#     fig, ax = plt.subplots(figsize=(6, 6))
+#     ax.imshow(frames[frame_id], cmap="gray", vmin=0, vmax=5000)
+
+#     for traj in trajectories:
+#         if frame_id < traj.start_frame:
+#             continue
+
+#         if frame_id <= traj.end_frame:
+#             valid_positions = traj.positions[:frame_id - traj.start_frame + 1]
+#         else:
+#             valid_positions = traj.positions
+
+#         if len(valid_positions) > 1:
+#             positions = np.array(valid_positions)
+#             y = positions[:, 0]
+#             x = positions[:, 1]
+#             ax.plot(x, y, '-', color=traj.color, linewidth=2)
+#             ax.plot(x[0], y[0], '^', color=traj.color, markersize=5)
+#             ax.plot(x[-1], y[-1], '+', color=traj.color, markersize=5)
+
+#     ax.set_title(title if title else f"Trajectories on frame {frame_id}")
+#     ax.axis("off")
+
+#     if save_path is not None:
+#         fig.savefig(save_path, dpi=200, bbox_inches="tight", pad_inches=0)
+
+#     plt.show()
+
+def show_trajectories(frames, trajectories, frame_id=0, title=None, save_path=None, show_id=False):
     fig, ax = plt.subplots(figsize=(6, 6))
     ax.imshow(frames[frame_id], cmap="gray", vmin=0, vmax=5000)
 
@@ -530,9 +507,21 @@ def show_trajectories(frames, trajectories, frame_id=0, title=None, save_path=No
             positions = np.array(valid_positions)
             y = positions[:, 0]
             x = positions[:, 1]
+
+            # Draw trajectory
             ax.plot(x, y, '-', color=traj.color, linewidth=2)
             ax.plot(x[0], y[0], '^', color=traj.color, markersize=5)
             ax.plot(x[-1], y[-1], '+', color=traj.color, markersize=5)
+
+            # Draw ID label
+            if show_id:
+                ax.text(
+                    x[-1] + 1, y[-1] + 1,          # slight offset
+                    str(traj.id),                 # trajectory ID
+                    color=traj.color,
+                    fontsize=8,
+                    weight='bold'
+                )
 
     ax.set_title(title if title else f"Trajectories on frame {frame_id}")
     ax.axis("off")
@@ -541,6 +530,7 @@ def show_trajectories(frames, trajectories, frame_id=0, title=None, save_path=No
         fig.savefig(save_path, dpi=200, bbox_inches="tight", pad_inches=0)
 
     plt.show()
+
 
 def linear_trajectories_visualizer(trajectories_new, trajectories_GT):
     import matplotlib.pyplot as plt
@@ -585,7 +575,7 @@ def linear_trajectories_visualizer(trajectories_new, trajectories_GT):
 from matplotlib.animation import FuncAnimation
 from IPython.display import HTML
 
-def animate_video(video, interval=300, cmap="gray", vmin=0, vmax=1000):
+def animate_video(video, interval=100, cmap="gray", vmin=0, vmax=1000):
     """
     Animate a video of shape (nframes, H, W).
     """
@@ -619,8 +609,8 @@ def print_diffusion_params(trajectories):
     for traj in trajectories:
         print(
             f"id={traj.id}"
-            f"D1={traj.D1_GT:.3f}, D2={traj.D2_GT:.3f}, "
-            f"theta={np.rad2deg(traj.theta_GT):.1f} deg"
+            f"D1={traj.D1:.3f}, D2={traj.D2:.3f}, "
+            f"theta={np.rad2deg(traj.theta):.1f} deg"
         )
 
 # ------------ PATCHES EXTRACTION AND VISUALIZATION -------------

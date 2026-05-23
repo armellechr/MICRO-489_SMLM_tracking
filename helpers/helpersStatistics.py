@@ -1,214 +1,77 @@
+# =============================================================================
+# Imports
+# =============================================================================
+
 import numpy as np
 import matplotlib.pyplot as plt
 import math
 from scipy.optimize import curve_fit
 
-# ----- MSD EXTRACTION -----
+# =============================================================================
+# Scalar MSD (isotropic only))
+# =============================================================================
 
-def msd_trajectory(trajectory):
+def calculateMSDtrajectory(trajectory):
     """Calculate the mean squared displacement (MSD) for a single trajectory.
     Args:
         trajectory: A Trajectory object containing positions of a single particle over time.
     Returns:
-        msd: A numpy array of shape (num_steps,) containing the MSD for each time lag.
+        MSD: A numpy array of shape (num_steps,) containing the MSD for each time lag.
     """
     L = trajectory.length()
     positions = np.array(trajectory.get_positions(), dtype=float)
 
-    msd = np.zeros(L)
+    MSD = np.zeros(L)
 
     for tau in range(1, L):
         displacements = positions[tau:] - positions[:L - tau]
         squared_displacements = np.sum(displacements**2, axis=1)
-        msd[tau] = np.mean(squared_displacements)
+        MSD[tau] = np.mean(squared_displacements)
 
-    return msd
+    return MSD
 
-def calculate_msd_trajectories(trajectories):
+def calculateMSDtrajectories(trajectories):
     """Calculate the mean squared displacement (MSD) for a list of trajectories.
     Args:
         trajectories: A list of Trajectory objects, each containing positions of a single particle over time.
     Returns:
-        msd: A dictionary where keys are trajectory IDs and values are numpy arrays of shape (num_steps,) containing the MSD for each time lag.
+        MSD: A dictionary where keys are trajectory IDs and values are numpy arrays of shape (num_steps,) containing the MSD for each time lag.
     """
+    MSD_list = []
     for traj in trajectories:
         if traj.id == None:
-            traj.msd = []
+            traj.MSD = []
         else:
-            msd_traj = msd_trajectory(traj)
-            traj.msd = msd_traj
+            MSD_traj = calculateMSDtrajectory(traj)
+            traj.MSD = MSD_traj
+            MSD_list.append(MSD_traj)
 
-def displacement_covariance_tensor(trajectory, tau=1):
+    return MSD_list
+
+# =============================================================================
+# Diffusion tensor estimation
+# =============================================================================
+
+def displacement_covariance(positions, tau):
     """
-    Estimate displacement covariance matrix for a given lag tau.
-
-    Returns
-    -------
-    C : ndarray, shape (2, 2)
-        Covariance-like second moment matrix:
-        C = mean[dr dr^T]
+    Compute the 2×2 displacement covariance matrix for a given lag tau.
     """
-    L = trajectory.length()
-    positions = np.array(trajectory.get_positions(), dtype=float)
-
+    L = len(positions)
     if L <= tau:
-        return None
+        return np.full((2, 2), np.nan)
 
     displacements = positions[tau:] - positions[:L - tau]
-
-    C = np.zeros((2, 2))
-    for dr in displacements:
-        C += np.outer(dr, dr)
-
-    C /= len(displacements)
-
+    C = np.mean([np.outer(dr, dr) for dr in displacements], axis=0)
     return C
 
-def estimate_anisotropic_D_from_trajectory(trajectory, dt=1.0, tau=1, target="trajectory"):
-    """
-    Estimate anisotropic diffusion parameters from one trajectory.
+def diffusion_tensor_from_covariance(C, dt, tau):
+    return C / (2 * tau * dt)
 
-    Parameters
-    ----------
-    trajectory : Trajectory
-    dt : float
-        Time between stored trajectory points.
-    tau : int
-        Lag used for estimation.
-    target : str
-        Which attributes to write:
-        - "trajectory"   -> D1_trajectory, D2_trajectory, theta_trajectory
-        - "detection"    -> D1_detection, D2_detection, theta_detection
-        - "localization" -> D1_localization, D2_localization, theta_localization
 
-    Returns
-    -------
-    D1, D2, theta, D_tensor
-    """
-    C = displacement_covariance_tensor(trajectory, tau=tau)
-
-    if C is None:
-        return None, None, None, None
-
-    # C ≈ 2 * D_tensor * tau * dt
-    D_tensor = C / (2 * tau * dt)
-
-    eigvals, eigvecs = np.linalg.eigh(D_tensor)
-
-    # sort eigenvalues descending
-    order = np.argsort(eigvals)[::-1]
-    eigvals = eigvals[order]
-    eigvecs = eigvecs[:, order]
-
-    D1 = float(eigvals[0])
-    D2 = float(eigvals[1])
-
-    principal_vec = eigvecs[:, 0]
-    theta = float(np.arctan2(principal_vec[1], principal_vec[0]))
-
-    # normalize theta to [0, pi), because diffusion axes have 180-degree symmetry
-    theta = theta % np.pi
-
-    if target == "trajectory":
-        trajectory.D1_trajectory = D1
-        trajectory.D2_trajectory = D2
-        trajectory.theta_trajectory = theta
-    elif target == "detection":
-        trajectory.D1_detection = D1
-        trajectory.D2_detection = D2
-        trajectory.theta_detection = theta
-    elif target == "localization":
-        trajectory.D1_localization = D1
-        trajectory.D2_localization = D2
-        trajectory.theta_localization = theta
-    else:
-        raise ValueError("target must be 'trajectory', 'detection', or 'localization'")
-
-    return D1, D2, theta, D_tensor
-
-def estimate_anisotropic_D_trajectories(trajectories, dt=1.0, tau=1, target="trajectory"):
-    results = []
-
-    for traj in trajectories:
-        D1, D2, theta, D_tensor = estimate_anisotropic_D_from_trajectory(
-            traj,
-            dt=dt,
-            tau=tau,
-            target=target
-        )
-
-        results.append({
-            "id": traj.id,
-            "D1": D1,
-            "D2": D2,
-            "theta": theta,
-            "D_tensor": D_tensor,
-        })
-
-    return results
-            
-
-# -------- MSD PLOTTING --------
-def plot_msd_vs_trajectory_msd(trajectories_new, trajectories_GT):
-    """
-    Plot each detected trajectory MSD against the GT trajectory MSD
-    matched by trajectory id.
-    Plot only trajectories that were assigned a GT id (i.e. traj.id is not None) and for which the GT id exists in the GT trajectories list.
-
-    Assumes:
-        - each traj in trajectories_new has traj.id set to the matched GT id
-        - each traj in trajectories_GT has its own GT id in traj.id
-        - traj.msd contains the MSD array/list
-    """
-    # map GT id -> GT trajectory
-    gt_by_id = {traj.id: traj for traj in trajectories_GT if traj.id is not None}
-
-    n = len(trajectories_new)
-    if n == 0:
-        print("No trajectories to plot.")
-        return
-
-    ncols = 2
-    nrows = math.ceil(n / ncols)
-
-    plt.figure(figsize=(12, 4 * nrows))
-
-    # mask to keep only trajectories with an ID different from -1
-    trajectories_new_assigned = [traj for traj in trajectories_new if traj.id is not None and traj.id != -1]
-
-    # plot only trajectories with a GT match
-    for i, traj_new in enumerate(trajectories_new_assigned):
-        plt.subplot(nrows, ncols, i + 1)
-
-        msd_new = traj_new.msd
-        gt_id = traj_new.id
-
-        # Plot detected / experimental MSD
-        if msd_new is not None and len(msd_new) > 0:
-            plt.plot(msd_new, label='Experimental MSD')
-
-        # Plot matched GT MSD if id exists and is found
-        if gt_id is not None and gt_id in gt_by_id:
-            msd_gt = gt_by_id[gt_id].msd
-            if msd_gt is not None and len(msd_gt) > 0:
-                plt.plot(msd_gt, ':', label='Ground-truth MSD')
-            plt.title(f'New traj matched to GT ID {gt_id}')
-        else:
-            plt.title(f'New traj ID {gt_id} (No GT match)')
-
-        plt.xlabel('Time lag (tau)')
-        plt.ylabel('MSD')
-        plt.legend()
-
-    plt.tight_layout()
-    plt.show()
-
-# ------ DIFFUSION TENSOR ESTIMATION -------
-def estimate_diffusion_tensor_from_trajectory(
+def estimateDfromTrajectory(
     trajectory,
     dt=1.0,
     tau=1,
-    target="trajectory",
 ):
     """
     Estimate D1, D2, theta from a trajectory using the displacement covariance tensor.
@@ -221,57 +84,36 @@ def estimate_diffusion_tensor_from_trajectory(
     For anisotropic diffusion:
         D1 > D2 and theta gives the main axis.
     """
-    L = trajectory.length()
     positions = np.asarray(trajectory.get_positions(), dtype=float)
 
-    if L <= tau:
-        D1 = D2 = theta = np.nan
-        D_tensor = np.full((2, 2), np.nan)
-    else:
-        displacements = positions[tau:] - positions[:L - tau]
+    C = displacement_covariance(positions, tau)
 
-        C = np.mean(
-            np.array([np.outer(dr, dr) for dr in displacements]),
-            axis=0
-        )
+    D_tensor = diffusion_tensor_from_covariance(C, dt, tau)
 
-        D_tensor = C / (2 * tau * dt)
+    eigvals, eigvecs = np.linalg.eigh(D_tensor)
 
-        eigvals, eigvecs = np.linalg.eigh(D_tensor)
+    order = np.argsort(eigvals)[::-1]
+    eigvals = eigvals[order]
+    eigvecs = eigvecs[:, order]
 
-        order = np.argsort(eigvals)[::-1]
-        eigvals = eigvals[order]
-        eigvecs = eigvecs[:, order]
+    D1 = float(eigvals[0])
+    D2 = float(eigvals[1])
 
-        D1 = float(eigvals[0])
-        D2 = float(eigvals[1])
+    principal_vec = eigvecs[:, 0]
+    theta = float(np.arctan2(principal_vec[1], principal_vec[0]) % np.pi)
 
-        principal_vec = eigvecs[:, 0]
-        theta = float(np.arctan2(principal_vec[1], principal_vec[0]) % np.pi)
-
-    if target == "trajectory":
-        trajectory.D1_trajectory = D1
-        trajectory.D2_trajectory = D2
-        trajectory.theta_trajectory = theta
-    elif target == "detection":
-        trajectory.D1_detection = D1
-        trajectory.D2_detection = D2
-        trajectory.theta_detection = theta
-    elif target == "localization":
-        trajectory.D1_localization = D1
-        trajectory.D2_localization = D2
-        trajectory.theta_localization = theta
-    else:
-        raise ValueError("target must be 'trajectory', 'detection', or 'localization'")
+    trajectory.D_tensor = D_tensor
+    trajectory.D1 = D1
+    trajectory.D2 = D2
+    trajectory.theta = theta
 
     return D1, D2, theta, D_tensor
 
 # list-level
-def estimate_diffusion_tensors(
+def estimateDfromTrajectories(
     trajectories,
     dt=1.0,
     tau=1,
-    target="trajectory",
 ):
     """
     Estimate diffusion tensor parameters for a list of trajectories.
@@ -279,11 +121,10 @@ def estimate_diffusion_tensors(
     results = []
 
     for traj in trajectories:
-        D1, D2, theta, D_tensor = estimate_diffusion_tensor_from_trajectory(
+        D1, D2, theta, D_tensor = estimateDfromTrajectory(
             traj,
             dt=dt,
             tau=tau,
-            target=target,
         )
 
         results.append({
@@ -291,127 +132,168 @@ def estimate_diffusion_tensors(
             "D1": D1,
             "D2": D2,
             "theta": theta,
-            "D_iso": (D1 + D2) / 2 if np.isfinite(D1) and np.isfinite(D2) else np.nan,
             "anisotropy": D2 / D1 if np.isfinite(D1) and D1 > 0 else np.nan,
             "D_tensor": D_tensor,
         })
 
     return results
 
-# ----- DIFFUSION COEFFICIENT ESTIMATION -----
+def tensor_to_scalar_D(D1, D2):
+    return 0.5 * (np.asarray(D1) + np.asarray(D2))
 
-def estimateDfromMSD(msd, time_range):
-    """
-    Estimates the diffusion coefficient (D) from the mean squared displacement (MSD) 
-    using linear regression without an intercept.
-    
-    Parameters:
-    - msd (numpy array): 1D array of MSD values.
-    - time_range (numpy array): 1D array of time values corresponding to MSD.
-    
-    Returns:
-    - D_estimated (float): Estimated diffusion coefficient.
-    """
-    # Solve the least squares problem to fit a line through the origin (y = slope * x)
-    slope, = np.linalg.lstsq(time_range.reshape(-1, 1), msd, rcond=None)[0]
-    
-    # Diffusion coefficient is the slope divided by 4
-    D_estimated = slope / 4 # FACTEUR 2 EN TROP
-    return D_estimated
+# =============================================================================
+# Scalar diffusion estimation from MSD
+# =============================================================================
 
-def estimateDfromTrajectories(trajectories):
-    D_list = []
+# def estimateDfromMSD(msd, time_range):
+#     """
+#     Estimates the diffusion coefficient (D) from the mean squared displacement (MSD) 
+#     using linear regression without an intercept.
+    
+#     Parameters:
+#     - msd (numpy array): 1D array of MSD values.
+#     - time_range (numpy array): 1D array of time values corresponding to MSD.
+    
+#     Returns:
+#     - D_estimated (float): Estimated diffusion coefficient.
+#     """
+#     # Solve the least squares problem to fit a line through the origin (y = slope * x)
+#     slope, = np.linalg.lstsq(time_range.reshape(-1, 1), msd, rcond=None)[0]
+    
+#     # Diffusion coefficient is the slope divided by 4
+#     D_estimated = slope / 4 # FACTEUR 2 EN TROP
+#     return D_estimated
+
+# def estimateDfromTrajectories(trajectories, mode='FR'):
+#     D_list = []
+
+#     for i, traj in enumerate(trajectories):
+#         try:
+#             msd = np.asarray(traj.msd, dtype=float)
+
+#             if msd.ndim != 1 or len(msd) < 2 or not np.all(np.isfinite(msd)):
+#                 D_val = np.nan
+#             else:
+#                 tau = np.arange(len(msd), dtype=float)
+#                 D_val = estimateDfromMSD(msd, tau)
+
+#             if mode == 'HR':
+#                 traj.D_HR = D_val
+#             elif mode == 'FR':
+#                 traj.D_FR = D_val
+#             elif mode == 'detection':
+#                 traj.D_detection = D_val
+#             elif mode == 'localization':
+#                 traj.D_localization = D_val
+
+#             D_list.append(D_val)
+
+#         except Exception as e:
+#             print(f"Trajectory {i}: error -> {e}")
+#             D_val = np.nan
+
+#             if mode == 'HR':
+#                 traj.D_HR = D_val
+#             elif mode == 'FR':
+#                 traj.D_FR = D_val
+#             elif mode == 'detection':
+#                 traj.D_detection = D_val
+#             elif mode == 'localization':
+#                 traj.D_localization = D_val
+
+#             D_list.append(D_val)
+
+#     return D_list
+
+# =============================================================================
+# Ground-truth and estimated parameter extraction
+# =============================================================================
+
+def get_traj_params(trajectories, nparticles=None):
+    """Extracts D1, D2, theta for a list of trajectories."""
+    if nparticles is None:
+        nparticles = len(trajectories)
+
+    D1 = []
+    D2 = []
+    theta = []
+
     for traj in trajectories:
-        D_traj = estimateDfromMSD(traj.msd, np.arange(len(traj.msd)))
-        traj.D_trajectory = D_traj
-        D_list.append(D_traj)
-    return D_list
 
-
-def estimateDfromTrajectories_safer(trajectories, mode='trajectory'): #@TODO: adapt D calculation to aniso case
-    D_list = []
-
-    for i, traj in enumerate(trajectories):
-        try:
-            msd = np.asarray(traj.msd, dtype=float)
-
-            if msd.ndim != 1 or len(msd) < 2 or not np.all(np.isfinite(msd)):
-                D_val = np.nan
-            else:
-                tau = np.arange(len(msd), dtype=float)
-                D_val = estimateDfromMSD(msd, tau)
-
-            # store in correct attribute
-            if mode == 'trajectory':
-                traj.D_trajectory = D_val
-            elif mode == 'detection':
-                traj.D_detection = D_val
-            elif mode == 'localization':
-                traj.D_localization = D_val
-
-            D_list.append(D_val)
-
-        except Exception as e:
-            print(f"Trajectory {i}: error -> {e}")
-            D_val = np.nan
-
-            if mode == 'trajectory':
-                traj.D_trajectory = D_val
-            elif mode == 'detection':
-                traj.D_detection = D_val
-            elif mode == 'localization':
-                traj.D_localization = D_val
-
-            D_list.append(D_val)
-
-    return D_list
-
-def get_estimated_tensor_params(trajectories, target="trajectory", n_GT=None):
-    if n_GT is None:
-        n_GT = len(trajectories)
-
-    D1 = np.full(n_GT, np.nan)
-    D2 = np.full(n_GT, np.nan)
-    theta = np.full(n_GT, np.nan)
-
-    for traj in trajectories:
-        if traj.id is None or traj.id == -1:
-            continue
-
-        if not (0 <= traj.id < n_GT):
-            continue
-
-        if target == "trajectory":
-            D1[traj.id] = traj.D1_trajectory
-            D2[traj.id] = traj.D2_trajectory
-            theta[traj.id] = traj.theta_trajectory
-        elif target == "detection":
-            D1[traj.id] = traj.D1_detection
-            D2[traj.id] = traj.D2_detection
-            theta[traj.id] = traj.theta_detection
-        elif target == "localization":
-            D1[traj.id] = traj.D1_localization
-            D2[traj.id] = traj.D2_localization
-            theta[traj.id] = traj.theta_localization
+        D1.append(traj.D1)
+        D2.append(traj.D2)
+        theta.append(traj.theta)
 
     return D1, D2, theta
 
-# -------- MAE CALCULATION ---------
+def get_traj_params_by_id(trajectories, id=None):
+    """Extracts D1, D2, theta for a single trajectory"""
+    for traj in trajectories:
+        if traj.id == id:
+            return traj.D1, traj.D2, traj.theta
 
-# get params
-def get_GT_tensor_params(trajectories_GT):
-    D1_GT = []
-    D2_GT = []
-    theta_GT = []
+    raise ValueError(f"No trajectory found with id {id}")
 
-    for traj in trajectories_GT:
-        D1_GT.append(traj.D1_GT)
-        D2_GT.append(traj.D2_GT)
-        theta_GT.append(traj.theta_GT)
+def get_traj_params_aligned(trajectories_list):
+    """Extracts D1, D2, theta for a list of trajectories, aligned by trajectory id across multiple lists."""
+    # Create a mapping from trajectory ID to its parameters for each list
+    params_by_id = {}
 
-    return np.array(D1_GT), np.array(D2_GT), np.array(theta_GT)
+    for trajectories in trajectories_list:
+        for traj in trajectories:
+            if traj.id is not None:
+                if traj.id not in params_by_id:
+                    params_by_id[traj.id] = {}
+                params_by_id[traj.id][traj] = {
+                    "D1": traj.D1,
+                    "D2": traj.D2,
+                    "theta": traj.theta,
+                }
 
-# angle error helper
+    # Now we can create aligned lists of parameters based on the IDs
+    aligned_params = {traj: {"D1": [], "D2": [], "theta": []} for traj in trajectories_list[0]}
+
+    for traj in aligned_params.keys():
+        for trajectories in trajectories_list:
+            if traj in params_by_id and traj in params_by_id[traj]:
+                aligned_params[traj]["D1"].append(params_by_id[traj][traj]["D1"])
+                aligned_params[traj]["D2"].append(params_by_id[traj][traj]["D2"])
+                aligned_params[traj]["theta"].append(params_by_id[traj][traj]["theta"])
+            else:
+                aligned_params[traj]["D1"].append(np.nan)
+                aligned_params[traj]["D2"].append(np.nan)
+                aligned_params[traj]["theta"].append(np.nan)
+
+    return aligned_params
+
+def print_traj_params(trajectories):
+    for traj in trajectories:
+        D1, D2, theta = traj.D1, traj.D2, traj.theta
+
+def print_traj_params_by_id(trajectories, id=None):
+    for traj in trajectories:
+        if traj.id == id:
+            D1, D2, theta = traj.D1, traj.D2, traj.theta
+
+            print(f"Parameters for trajectory ID {id}: D1={D1:.3f}, D2={D2:.3f}, theta={theta:.3f}")
+            return
+
+    print(f"No trajectory found with id {id}")
+
+def print_traj_params_aligned(trajectories_list):
+    aligned_params = get_traj_params_aligned(trajectories_list)
+
+    print(f"Parameters (aligned by trajectory ID):")
+    for traj, params in aligned_params.items():
+        D1_values = ", ".join(f"{d:.3f}" if np.isfinite(d) else "nan" for d in params["D1"])
+        D2_values = ", ".join(f"{d:.3f}" if np.isfinite(d) else "nan" for d in params["D2"])
+        theta_values = ", ".join(f"{d:.3f}" if np.isfinite(d) else "nan" for d in params["theta"])
+        print(f"Trajectory ID {traj.id}: D1=[{D1_values}], D2=[{D2_values}], theta=[{theta_values}]")
+
+# =============================================================================
+# Error metrics
+# =============================================================================
+
 def angular_error_pi_periodic(theta_est, theta_GT):
     """
     Angle error for diffusion axes, where theta and theta + pi are equivalent.
@@ -428,7 +310,6 @@ def angular_error_pi_periodic(theta_est, theta_GT):
 def compute_tensor_MAE(
     trajectories_est,
     trajectories_GT,
-    target="detection",
     angle=False,
 ):
     """
@@ -436,28 +317,26 @@ def compute_tensor_MAE(
     """
     n_GT = len(trajectories_GT)
 
-    D1_GT, D2_GT, theta_GT = get_GT_tensor_params(trajectories_GT)
+    D1_GT, D2_GT, theta_GT = get_traj_params(trajectories_GT)
 
-    estimate_diffusion_tensors(
+    estimateDfromTrajectories(
         trajectories_est,
         dt=1.0,
         tau=1,
-        target=target,
     )
 
-    D1_est, D2_est, theta_est = get_estimated_tensor_params(
+    D1_est, D2_est, theta_est = get_traj_params(
         trajectories_est,
-        target=target,
         n_GT=n_GT,
     )
 
     MAE_D1 = np.abs(D1_est - D1_GT)
     MAE_D2 = np.abs(D2_est - D2_GT)
 
-    print(f"{target} D1:")
+    print(f"D1:")
     print([f"{d:.3f}" if np.isfinite(d) else "nan" for d in D1_est])
 
-    print(f"{target} D2:")
+    print(f"D2:")
     print([f"{d:.3f}" if np.isfinite(d) else "nan" for d in D2_est])
 
     print(f"MAE D1:")
@@ -479,55 +358,74 @@ def compute_MAE(truth, estimate):
         return None
     return abs(truth - estimate)
 
-def compute_D_trajectory(trajectories_GT, D_GT):
+def compute_D_HR(trajectories_HR):
 
     # compute and set MSD in trajectory objects
-    calculate_msd_trajectories(trajectories_GT)
+    calculateMSDtrajectories(trajectories_HR)
     
-    # compute and print D_trajectory for each trajectory
-    D_trajectory = estimateDfromTrajectories_safer(trajectories_GT, 'trajectory')
-    print(f"D_trajectory: \n[{', '.join(f'{float(d):.3f}' for d in D_trajectory)}]")
+    # compute and print D_FR for each trajectory
+    D_HR = estimateDfromTrajectories(trajectories_HR, 'HR')
+    print(f"D_HR: \n[{', '.join(f'{float(d):.3f}' for d in D_HR)}]")
     
-    return D_trajectory
+    return D_HR
 
-def compute_MAE_trajectory(trajectories_GT, D_GT):
+def compute_MAE_HR(trajectories_HR, D_GT):
 
-    # compute and set MSD in trajectory objects
-    calculate_msd_trajectories(trajectories_GT)
-    
-    # compute and print D_trajectory for each trajectory
-    D_trajectory = estimateDfromTrajectories_safer(trajectories_GT, 'trajectory')
-    print(f"D_trajectory: \n[{', '.join(f'{float(d):.3f}' for d in D_trajectory)}]")
+    D_HR = compute_D_HR(trajectories_HR)
     
     # compute and print MAE for D_trajectory
-    MAE_trajectory = np.abs(np.array(D_trajectory) - np.array(D_GT))
-    print(f"MAE for D_trajectory: \n[{', '.join(f'{float(d):.3f}' for d in MAE_trajectory)}]")  
+    MAE_HR = np.abs(np.array(D_HR) - np.array(D_GT))
+    print(f"MAE for D_HR: \n[{', '.join(f'{float(d):.3f}' for d in MAE_HR)}]")  
 
-    return MAE_trajectory
+    return MAE_HR
 
-# def compute_MAE_detection(trajectories_detection, D_GT):
+def compute_D_FR(trajectories_GT):
 
-#     # compute and set MSD in trajectory objects
-#     calculate_msd_trajectories(trajectories_detection)
-
-#     # compute and print D_detection for each trajectory
-#     D_detection = estimateDfromTrajectories_safer(trajectories_detection, 'detection')
-#     print(f"D_detection: \n[{', '.join(f'{float(d):.3f}' for d in D_detection)}]")
+    # compute and set MSD in trajectory objects
+    calculateMSDtrajectories(trajectories_GT)
     
-#     # compute and print MAE for D_detection based on D_GT indices
-#     MAE_detection = {}
-#     for traj in trajectories_detection:
-#         if traj.id is not None and traj.id < len(D_GT):
-#             mae = compute_MAE(traj.D_detection, D_GT[traj.id])
-#             MAE_detection[traj.id] = mae
-#         else:
-#             print(f"No valid GT match for detected trajectory {traj.id}.")
-#             MAE_detection[traj.id] = None
+    # compute and print D_FR for each trajectory
+    D_FR = estimateDfromTrajectories(trajectories_GT, 'FR')
+    print(f"D_FR: \n[{', '.join(f'{float(d):.3f}' for d in D_FR)}]")
     
+    return D_FR
+
+def compute_MAE_FR(trajectories_GT, D_GT):
+
+    # compute and set MSD in trajectory objects
+    calculateMSDtrajectories(trajectories_GT)
+    
+    # compute and print D_FR for each trajectory
+    D_FR = estimateDfromTrajectories(trajectories_GT, 'FR')
+    print(f"D_FR: \n[{', '.join(f'{float(d):.3f}' for d in D_FR)}]")
+    
+    # compute and print MAE for D_trajectory
+    MAE_FR = np.abs(np.array(D_FR) - np.array(D_GT))
+    print(f"MAE for D_FR: \n[{', '.join(f'{float(d):.3f}' for d in MAE_FR)}]")  
+
+    return MAE_FR
+
+def compute_D_detection(trajectories_detection, D_GT):
+    calculateMSDtrajectories(trajectories_detection)
+
+    estimateDfromTrajectories(trajectories_detection, 'detection')
+
+    # initialize list aligned with GT
+    D_detection = [np.nan] * len(D_GT)
+
+    for traj in trajectories_detection:
+        if traj.id is not None and 0 <= traj.id <= len(D_GT) - 1:
+            D_detection[traj.id] = traj.D_detection
+
+    print("D_detection:")
+    print([f"{d:.3f}" if np.isfinite(d) else "nan" for d in D_detection])
+
+    return D_detection
+
 def compute_MAE_detection(trajectories_detection, D_GT):
-    calculate_msd_trajectories(trajectories_detection)
+    calculateMSDtrajectories(trajectories_detection)
 
-    estimateDfromTrajectories_safer(trajectories_detection, 'detection')
+    estimateDfromTrajectories(trajectories_detection, 'detection')
 
     # initialize list aligned with GT
     D_detection = [np.nan] * len(D_GT)
@@ -546,27 +444,26 @@ def compute_MAE_detection(trajectories_detection, D_GT):
     
     return MAE_detection
 
-def compute_D_detection(trajectories_detection, D_GT):
-    calculate_msd_trajectories(trajectories_detection)
+def compute_D_localization(trajectories_localization, D_GT):
+    calculateMSDtrajectories(trajectories_localization)
 
-    estimateDfromTrajectories_safer(trajectories_detection, 'detection')
+    estimateDfromTrajectories(trajectories_localization, 'localization')
 
-    # initialize list aligned with GT
-    D_detection = [np.nan] * len(D_GT)
+    D_localization = [np.nan] * len(D_GT)
 
-    for traj in trajectories_detection:
+    for traj in trajectories_localization:
         if traj.id is not None and 0 <= traj.id <= len(D_GT) - 1:
-            D_detection[traj.id] = traj.D_detection
+            D_localization[traj.id] = traj.D_localization
 
-    print("D_detection:")
-    print([f"{d:.3f}" if np.isfinite(d) else "nan" for d in D_detection])
+    print("D_localization:")
+    print([f"{d:.3f}" if np.isfinite(d) else "nan" for d in D_localization])
 
-    return D_detection
+    return D_localization
 
 def compute_MAE_localization(trajectories_localization, D_GT):
-    calculate_msd_trajectories(trajectories_localization)
+    calculateMSDtrajectories(trajectories_localization)
 
-    estimateDfromTrajectories_safer(trajectories_localization, 'localization')
+    estimateDfromTrajectories(trajectories_localization, 'localization')
 
     D_localization = [np.nan] * len(D_GT)
 
@@ -584,22 +481,140 @@ def compute_MAE_localization(trajectories_localization, D_GT):
 
     return MAE_localization
 
-def compute_D_localization(trajectories_localization, D_GT):
-    calculate_msd_trajectories(trajectories_localization)
+def evaluate_diffusion(
+    trajectories_est,
+    trajectories_GT,
+    target="localization",
+    dt=1.0,
+    tau=1,
+    angle=True,
+):
+    """
+    Estimate diffusion tensors and compute errors against ground truth.
 
-    estimateDfromTrajectories_safer(trajectories_localization, 'localization')
+    Works for both isotropic and anisotropic diffusion. Isotropic diffusion is
+    treated as the special case where D1 ≈ D2.
 
-    D_localization = [np.nan] * len(D_GT)
+    Parameters
+    ----------
+    trajectories_est : list of Trajectory
+        Estimated trajectories assigned to GT ids.
+    trajectories_GT : list of Trajectory
+        Ground-truth trajectories.
+    target : {"trajectory", "detection", "localization"}
+        Attribute namespace where estimated values are stored.
+    dt : float
+        Time between stored trajectory points.
+    tau : int
+        Lag used for tensor estimation.
+    angle : bool
+        If True, also compute angular error.
 
-    for traj in trajectories_localization:
-        if traj.id is not None and 0 <= traj.id <= len(D_GT) - 1:
-            D_localization[traj.id] = traj.D_localization
+    Returns
+    -------
+    dict
+        Dictionary containing GT parameters, estimated parameters, and errors.
+    """
+    n_GT = len(trajectories_GT)
 
-    print("D_localization:")
-    print([f"{d:.3f}" if np.isfinite(d) else "nan" for d in D_localization])
+    # estimate_diffusion_tensors(
+    #     trajectories_est,
+    #     dt=dt,
+    #     tau=tau,
+    #     target=target,
+    # )
 
-    return D_localization
+    D1_GT, D2_GT, theta_GT = get_traj_params(trajectories_GT, target='GT')
 
+    D1_est, D2_est, theta_est = get_traj_params(
+        trajectories_est,
+        nparticles=n_GT,
+        target=target
+    )
+
+    D_iso_GT = tensor_to_scalar_D(D1_GT, D2_GT)
+    D_iso_est = tensor_to_scalar_D(D1_est, D2_est)
+
+    errors = {
+        "D1": np.abs(np.array(D1_est) - np.array(D1_GT)),
+        "D2": np.abs(np.array(D2_est) - np.array(D2_GT)),
+        "D_iso": np.abs(np.array(D_iso_est) - np.array(D_iso_GT))
+    }
+
+    if angle:
+        errors["theta"] = angular_error_pi_periodic(theta_est, theta_GT)
+
+    return {
+        "target": target,
+        "D1_GT": D1_GT,
+        "D2_GT": D2_GT,
+        "theta_GT": theta_GT,
+        "D1_est": D1_est,
+        "D2_est": D2_est,
+        "theta_est": theta_est,
+        "D_iso_GT": D_iso_GT,
+        "D_iso_est": D_iso_est,
+        "errors": errors,
+    }
+
+
+# =============================================================================
+# Plotting helpers
+# =============================================================================
+
+def plotMSDvsGT(trajectories_new, trajectories_GT):
+    """
+    Plot each detected trajectory MSD against the GT trajectory MSD
+    matched by trajectory id.
+    Plot only trajectories that were assigned a GT id (i.e. traj.id is not None) and for which the GT id exists in the GT trajectories list.
+
+    Assumes:
+        - each traj in trajectories_new has traj.id set to the matched GT id
+        - each traj in trajectories_GT has its own GT id in traj.id
+        - traj.MSD contains the MSD array/list
+    """
+    # map GT id -> GT trajectory
+    gt_by_id = {traj.id: traj for traj in trajectories_GT if traj.id is not None}
+
+    n = len(trajectories_new)
+    if n == 0:
+        print("No trajectories to plot.")
+        return
+
+    ncols = 2
+    nrows = math.ceil(n / ncols)
+
+    plt.figure(figsize=(12, 4 * nrows))
+
+    # mask to keep only trajectories with an ID different from -1
+    trajectories_new_assigned = [traj for traj in trajectories_new if traj.id is not None and traj.id != -1]
+
+    # plot only trajectories with a GT match
+    for i, traj_new in enumerate(trajectories_new_assigned):
+        plt.subplot(nrows, ncols, i + 1)
+
+        MSD_new = traj_new.MSD
+        gt_id = traj_new.id
+
+        # Plot detected / experimental MSD
+        if MSD_new is not None and len(MSD_new) > 0:
+            plt.plot(MSD_new, label='Experimental MSD')
+
+        # Plot matched GT MSD if id exists and is found
+        if gt_id is not None and gt_id in gt_by_id:
+            MSD_gt = gt_by_id[gt_id].MSD
+            if MSD_gt is not None and len(MSD_gt) > 0:
+                plt.plot(MSD_gt, ':', label='Ground-truth MSD')
+            plt.title(f'New traj matched to GT ID {gt_id}')
+        else:
+            plt.title(f'New traj ID {gt_id} (No GT match)')
+
+        plt.xlabel('Time lag (tau)')
+        plt.ylabel('MSD')
+        plt.legend()
+
+    plt.tight_layout()
+    plt.show()
 
 def scatter_mae_cloud(D, MAE_array, label, color='blue'):
     D = np.asarray(D)
@@ -658,8 +673,6 @@ def fit_line_D(D, D_array):
     except Exception as e:
         print(f"Error fitting line: {e}")
         return None
-
-
 
 def plot_MAEs_vs_D(D, MAE_t_array, MAE_d_array, MAE_l_array):
 
@@ -760,44 +773,3 @@ def plot_Ds_vs_D_GT(D_t, D_d, D_l, D):
     plt.grid()
     plt.show()
 
-# --------- D ESTIMATION ----------
-def tensor_to_scalar_D(D1, D2):
-    return 0.5 * (np.asarray(D1) + np.asarray(D2))
-
-    
-# --------- old --------------
-# def compute_MAEs_setD(F, N, D):
-
-#     frames, trajectories_GT, D_GT = generate_frames_setD(F, N, D)
-
-#     # traj_GT
-#     MAE_trajectory = compute_MAE_trajectory(trajectories_GT, D_GT)
-#     # detection
-#     detected_peaks = detect_peaks(frames)
-#     trajectories_detection = NN_tracking(detected_peaks, max_distance=5)
-#     trajectories_detection, min_cost, _ = assign_trajectories(trajectories_detection, trajectories_GT, algorithm='hungarian')
-#     MAE_detection = compute_MAE_detection(trajectories_detection, D_GT)
-#     # localization
-#     localized_peaks = localize_peaks_with_gaussian_fitting(frames, detected_peaks)
-#     trajectories_localization = NN_tracking(localized_peaks, max_distance=5)
-#     trajectories_localization, min_cost, _ = assign_trajectories(trajectories_localization, trajectories_GT, algorithm='hungarian')
-#     MAE_localization = compute_MAE_localization(trajectories_localization, D_GT)
-    
-# def compute_Ds(F, N, D, amp=1000):
-
-#     frames, trajectories_GT, D_GT = generate_frames_blinking(F, N, D, amp=amp)
-
-#     # traj_GT
-#     D_trajectory = compute_D_trajectory(trajectories_GT, D_GT)
-#     # detection
-#     detected_peaks = detect_peaks(frames)
-#     trajectories_detection = NN_tracking(detected_peaks, max_distance=5)
-#     trajectories_detection, min_cost, _ = assign_trajectories(trajectories_detection, trajectories_GT, algorithm='hungarian')
-#     D_detection = compute_D_detection(trajectories_detection, D_GT)
-#     # localization
-#     localized_peaks = localize_peaks_with_gaussian_fitting(frames, detected_peaks)
-#     trajectories_localization = NN_tracking(localized_peaks, max_distance=5)
-#     trajectories_localization, min_cost, _ = assign_trajectories(trajectories_localization, trajectories_GT, algorithm='hungarian')
-#     D_localization = compute_D_localization(trajectories_localization, D_GT)
-
-#     return D_trajectory, D_detection, D_localization

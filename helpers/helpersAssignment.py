@@ -196,18 +196,6 @@ def hungarian_pypi(cost):
 
     return min_cost, assignment
 
-
-# def cog(trajectory):
-#     positions = trajectory.get_positions()
-#     if len(positions) == 0:
-#         print(f"Found no positions for trajectory {trajectory.id} -> set id to None")
-#         return None
-#     rows = [pos[0] for pos in positions]
-#     cols = [pos[1] for pos in positions]
-#     cog_row = np.mean(rows) # simple mean in rows
-#     cog_col = np.mean(cols) # simple mean in cols
-#     return (float(cog_row), float(cog_col))
-
 # ------------------------- Cost functions and cost matrix for assignment -------------------------
 def cog(trajectory):
     positions = trajectory.get_positions()
@@ -230,44 +218,6 @@ def cost_cog(traj_new, traj_GT, invalid_cost=np.inf):
 
     return np.linalg.norm(np.array(cog_new) - np.array(cog_GT))
 
-# old
-# def cost_particles_frame2frame(
-#     trajectory,
-#     detection,
-#     distance=True,
-#     intensity=True,
-#     sigma=True,
-#     lambda1=0.5,
-#     lambda2=0.4,
-#     lambda3=0.1,
-# ):
-#     pos, det_intensity, det_sigma = detection
-
-#     cost = 0.0
-
-#     if distance:
-#         dist = np.linalg.norm(np.array(trajectory.last_position()) - np.array(pos))
-#         dist_norm = 0.25 * 128
-#         cost += lambda1 * (dist / dist_norm)
-#         print(f'Dist cost: {lambda1 * (dist / dist_norm)}')
-
-#     if intensity:
-#         last_intensity = trajectory.last_intensity()
-#         if last_intensity is not None and det_intensity is not None:
-#             intensity_diff = abs(last_intensity - det_intensity)
-#             intensity_norm = 650
-#             cost += lambda2 * (intensity_diff / intensity_norm)
-#             print(f'Intensity cost: {lambda2 * (intensity_diff / intensity_norm)}')
-
-#     if sigma:
-#         last_sigma = trajectory.last_sigma()
-#         if last_sigma is not None and det_sigma is not None:
-#             sigma_diff = abs(last_sigma - det_sigma)
-#             sigma_norm = 2.0
-#             cost += lambda3 * (sigma_diff / sigma_norm)
-#             print(f'Sigma cost: {lambda3 * (sigma_diff / sigma_norm)}')
-
-#     return cost
 
 # definition of the cost matrix
 def compute_cost_matrix_trajectories(trajectories_new, trajectories_GT, cost_function=None):
@@ -277,7 +227,15 @@ def compute_cost_matrix_trajectories(trajectories_new, trajectories_GT, cost_fun
     cost_matrix = np.zeros((len(trajectories_new), len(trajectories_GT)))
     for i, traj_new in enumerate(trajectories_new):
         for j, traj_GT in enumerate(trajectories_GT):
-            cost_matrix[i, j] = cost_function(traj_new, traj_GT)
+            cost_value = cost_function(traj_new, traj_GT)
+
+            if isinstance(cost_value, tuple):
+                cost_value = cost_value[0]
+
+            if torch.is_tensor(cost_value):
+                cost_value = cost_value.detach().cpu().item()
+
+            cost_matrix[i, j] = float(cost_value)
     return cost_matrix
 
 def compute_cost_matrix_p2p(peaks_f1, peaks_f2, distance=True, intensity_diff=False, sigma_diff=False):
@@ -462,6 +420,18 @@ def assign_trajectories(
          min_cost: the minimum cost of the assignment
          assignment: list where assignment[i] is the index of the trajectory in trajectories_GT assigned to trajectories_new[i], or -1 if no assignment was made
     """
+    if len(trajectories_new) == 0:
+        if verbose:
+            print("No new trajectories to assign.")
+        return trajectories_new, np.inf, []
+
+    if len(trajectories_GT) == 0:
+        if verbose:
+            print("No ground-truth trajectories available.")
+        return trajectories_new, np.inf, [-1] * len(trajectories_new)
+
+    if cost_function is None:
+        cost_function = TrajToTraj.default()
     cost = compute_cost_matrix_trajectories(trajectories_new, trajectories_GT, cost_function=cost_function)
 
     if verbose:
@@ -654,8 +624,8 @@ class PeakToPeak(nn.Module):
     def default(cls):
         return cls(
             terms={
-                "distance": DistanceTerm(weight=0.5, norm=0.25 * 128),
-                "intensity": IntensityTerm(weight=0.4, norm=650),
+                "distance": DistanceTerm(weight=0.5, norm=0.1 * 128),
+                "intensity": IntensityTerm(weight=0.4, norm=1000),
                 "sigma": SigmaTerm(weight=0.1, norm=2.0),
             }
         )
@@ -672,4 +642,99 @@ class PeakToPeak(nn.Module):
             return total, costs
 
         return total
+    
+class TrajToTrajTerm(nn.Module):
+    def __init__(self, weight=1.0, norm=1.0, enabled=True):
+        super().__init__()
+        self.weight = weight
+        self.norm = norm
+        self.enabled = enabled
 
+    def forward(self, traj1, traj2):
+        raise NotImplementedError
+
+class MeanPositionDistanceTerm(TrajToTrajTerm):
+    def __init__(self, weight=1.0, norm=1.0, enabled=True, invalid_cost=1e6):
+        super().__init__(weight=weight, norm=norm, enabled=enabled)
+        self.invalid_cost = invalid_cost
+
+    def forward(self, traj1, traj2):
+        if not self.enabled:
+            return torch.tensor(0.0)
+
+        interval = overlap_interval(traj1, traj2)
+
+        if interval is None:
+            return torch.tensor(self.invalid_cost)
+
+        start, end = interval
+        distances = []
+
+        for f in range(start, end + 1):
+            p1 = traj1.get_position_at_frame(f)
+            p2 = traj2.get_position_at_frame(f)
+
+            if p1 is None or p2 is None:
+                continue
+
+            p1 = torch.as_tensor(p1, dtype=torch.float32)
+            p2 = torch.as_tensor(p2, dtype=torch.float32)
+
+            distances.append(torch.linalg.norm(p1 - p2))
+
+        if len(distances) == 0:
+            return torch.tensor(self.invalid_cost)
+
+        mean_dist = torch.mean(torch.stack(distances))
+
+        return self.weight * (mean_dist / self.norm)
+    
+class TrajToTraj(nn.Module):
+    def __init__(self, terms=None, return_breakdown=False):
+        super().__init__()
+
+        if terms is None:
+            terms = {}
+
+        self.terms = nn.ModuleDict(terms)
+        self.return_breakdown = return_breakdown
+
+    @classmethod
+    def default(cls):
+        return cls(
+            terms={
+                "mean_position_distance": MeanPositionDistanceTerm(
+                    weight=1.0,
+                    norm=1.0,
+                )
+            }
+        )
+
+    def forward(self, traj1, traj2):
+        costs = {
+            name: term(traj1, traj2)
+            for name, term in self.terms.items()
+        }
+
+        total = sum(costs.values())
+
+        if self.return_breakdown:
+            return total, costs
+
+        return total
+    
+class LengthDifferenceTerm(TrajToTrajTerm):
+    def forward(self, traj1, traj2):
+        if not self.enabled:
+            return torch.tensor(0.0)
+
+        diff = abs(traj1.length() - traj2.length())
+        return torch.tensor(self.weight * (diff / self.norm), dtype=torch.float32)
+    
+class StartFrameDifferenceTerm(TrajToTrajTerm):
+    def forward(self, traj1, traj2):
+        if not self.enabled:
+            return torch.tensor(0.0)
+
+        diff = abs(traj1.start_frame - traj2.start_frame)
+        return torch.tensor(self.weight * (diff / self.norm), dtype=torch.float32)

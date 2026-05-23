@@ -435,10 +435,6 @@ def assign_trajectories(
     cost = compute_cost_matrix_trajectories(trajectories_new, trajectories_GT, cost_function=cost_function)
 
     if verbose:
-        print("Cost matrix:")
-        print(cost)
-
-    if verbose:
         print('Computing assignment using algorithm:', algorithm)
 
     if algorithm == 'hungarian':

@@ -10,12 +10,18 @@ from skimage.measure import block_reduce
 class Trajectory:
     def __init__(self, id, initial_position=None, start_frame=0,
              D1_ini=None, D2_ini=None, theta_ini=None,
-             initial_intensity=None, initial_sigma=None):
+             initial_intensity=None, initial_sigma=None,
+             particle_type="particle", initial_state=None,
+             initial_bound_to=None, metadata=None):
     
         self.id = id
         self.positions = []
         self.intensities = []
         self.sigmas = []
+        self.states = []
+        self.bound_to = []
+        self.particle_type = particle_type
+        self.metadata = metadata or {}
         self.color = (random.random(), random.random(), random.random())
 
         # Diffusion parameters
@@ -32,12 +38,22 @@ class Trajectory:
             self.positions.append(tuple(initial_position))
             self.intensities.append(initial_intensity)
             self.sigmas.append(initial_sigma)
+            self.states.append(initial_state)
+            self.bound_to.append(initial_bound_to)
             self.end_frame = start_frame
 
     def set_id(self, id):
         self.id = id
 
-    def add_position(self, position, frame=None, intensity=None, sigma=None):
+    def add_position(
+        self,
+        position,
+        frame=None,
+        intensity=None,
+        sigma=None,
+        state=None,
+        bound_to=None,
+    ):
         if frame is None:
             frame = self.end_frame + 1 if self.positions else self.start_frame
 
@@ -47,6 +63,8 @@ class Trajectory:
             self.positions.append(tuple(position))
             self.intensities.append(intensity)
             self.sigmas.append(sigma)
+            self.states.append(state)
+            self.bound_to.append(bound_to)
             return
 
         if frame != self.end_frame + 1:
@@ -57,6 +75,8 @@ class Trajectory:
         self.positions.append(tuple(position))
         self.intensities.append(intensity)
         self.sigmas.append(sigma)
+        self.states.append(state)
+        self.bound_to.append(bound_to)
         self.end_frame = frame
 
     def get_positions(self):
@@ -67,6 +87,12 @@ class Trajectory:
     
     def get_sigmas(self):
         return self.sigmas
+
+    def get_states(self):
+        return self.states
+
+    def get_bound_to(self):
+        return self.bound_to
 
     def get_position_at_frame(self, frame):
         if frame < self.start_frame or frame > self.end_frame:
@@ -83,6 +109,16 @@ class Trajectory:
             return None
         return self.sigmas[frame - self.start_frame]
 
+    def get_state_at_frame(self, frame):
+        if frame < self.start_frame or frame > self.end_frame:
+            return None
+        return self.states[frame - self.start_frame]
+
+    def get_bound_to_at_frame(self, frame):
+        if frame < self.start_frame or frame > self.end_frame:
+            return None
+        return self.bound_to[frame - self.start_frame]
+
     def frames(self):
         return list(range(self.start_frame, self.end_frame + 1))
 
@@ -94,6 +130,12 @@ class Trajectory:
 
     def last_sigma(self):
         return self.sigmas[-1] if self.sigmas else None
+
+    def last_state(self):
+        return self.states[-1] if self.states else None
+
+    def last_bound_to(self):
+        return self.bound_to[-1] if self.bound_to else None
 
     def length(self):
         return len(self.positions)
@@ -180,7 +222,8 @@ def simulate_brownian_motion(
     sigma_mean=1.0,
     sigma_std=0.2,
     anisotropy_ratio_range=(0.1, 1.0),
-    theta_range=(0, np.pi)
+    theta_range=(0, np.pi),
+    particle_type="particle",
 ):
     """
     Simulate Brownian motion trajectories for multiple particles, each with a diffusion coefficient D drawn from a provided distribution.
@@ -214,6 +257,8 @@ def simulate_brownian_motion(
         Tuple that defines the range of possible ratios D2/D1.
     theta_range:
         Tuple that defines the range of possible angles (in radians) for the principal diffusion axis.
+    particle_type:
+        Label attached to every generated trajectory.
     """
     num_steps = nframes * nposframe
 
@@ -254,7 +299,8 @@ def simulate_brownian_motion(
             start_frame=0,
             D1_ini=D1,
             D2_ini=D2,
-            theta_ini=theta
+            theta_ini=theta,
+            particle_type=particle_type,
         )
 
         for t in range(num_steps):
@@ -265,12 +311,346 @@ def simulate_brownian_motion(
                 tuple(positions[t]),
                 frame=t,
                 intensity=base_intensity,
-                sigma=base_sigma
+                sigma=base_sigma,
+                state="free",
+                bound_to=None,
             )
 
         trajectories.append(traj)
 
     return trajectories
+
+
+def _sample_diffusion_value(D_config):
+    if isinstance(D_config, (int, float, np.integer, np.floating)):
+        return float(D_config)
+
+    D_values = [d for d, _ in D_config]
+    probs = np.array([p for _, p in D_config], dtype=float)
+    probs /= probs.sum()
+    return float(np.random.choice(D_values, p=probs))
+
+
+def _sample_positive_normal(mean, std, min_value=0.0):
+    return max(float(np.random.normal(mean, std)), min_value)
+
+
+def _random_position(frame_size, boundary_margin):
+    width, height = frame_size
+    return np.array([
+        np.random.uniform(boundary_margin, width - boundary_margin),
+        np.random.uniform(boundary_margin, height - boundary_margin),
+    ])
+
+
+def _reflect_position(position, frame_size):
+    reflected = np.array(position, dtype=float)
+
+    for axis, limit in enumerate(frame_size):
+        if limit <= 1:
+            reflected[axis] = 0.0
+            continue
+
+        while reflected[axis] < 0 or reflected[axis] >= limit:
+            if reflected[axis] < 0:
+                reflected[axis] = -reflected[axis]
+            if reflected[axis] >= limit:
+                reflected[axis] = 2 * (limit - 1) - reflected[axis]
+
+    return reflected
+
+
+def simulate_ligand_receptor_motion(
+    n_ligands,
+    n_receptors,
+    nframes,
+    nposframe,
+    dt,
+    ligand_D=4.0,
+    receptor_D=0.02,
+    frame_size=(128, 128),
+    boundary_margin=10,
+    binding_radius=3.0,
+    kon=0.4,
+    koff=0.03,
+    allow_multiple_ligands_per_receptor=False,
+    bound_position_noise=0.15,
+    ligand_intensity_mean=550,
+    ligand_intensity_std=100,
+    receptor_intensity_mean=950,
+    receptor_intensity_std=150,
+    ligand_sigma_mean=0.75,
+    ligand_sigma_std=0.08,
+    receptor_sigma_mean=1.35,
+    receptor_sigma_std=0.12,
+    ligand_start_positions=None,
+    receptor_start_positions=None,
+    reflect_boundaries=True,
+    return_events=False,
+):
+    """
+    Simulate two interacting populations: fast ligands and slow receptors.
+
+    Ligands diffuse freely until they are within ``binding_radius`` of an
+    available receptor. Binding and unbinding probabilities are computed from
+    ``kon`` and ``koff`` at the subframe time step ``dt / nposframe``.
+    """
+    num_steps = nframes * nposframe
+    sub_dt = dt / nposframe
+    p_on = 1.0 - np.exp(-kon * sub_dt)
+    p_off = 1.0 - np.exp(-koff * sub_dt)
+
+    receptor_ids = list(range(n_receptors))
+    ligand_ids = list(range(n_receptors, n_receptors + n_ligands))
+
+    receptor_positions = np.zeros((n_receptors, num_steps, 2), dtype=float)
+    receptor_D_values = []
+
+    for r in range(n_receptors):
+        D = _sample_diffusion_value(receptor_D)
+        receptor_D_values.append(D)
+
+        if receptor_start_positions is None:
+            receptor_positions[r, 0] = _random_position(frame_size, boundary_margin)
+        else:
+            receptor_positions[r, 0] = receptor_start_positions[r]
+
+        if num_steps > 1:
+            steps = generate_diffusion_steps(
+                num_steps=num_steps - 1,
+                D1=D,
+                D2=D,
+                theta=0.0,
+                dt=dt,
+                nposframe=nposframe,
+            )
+
+            for t in range(1, num_steps):
+                receptor_positions[r, t] = receptor_positions[r, t - 1] + steps[t - 1]
+                if reflect_boundaries:
+                    receptor_positions[r, t] = _reflect_position(
+                        receptor_positions[r, t],
+                        frame_size,
+                    )
+
+    ligand_positions = np.zeros((n_ligands, num_steps, 2), dtype=float)
+    ligand_states = np.full((n_ligands, num_steps), "free", dtype=object)
+    ligand_bound_to = np.full((n_ligands, num_steps), None, dtype=object)
+    ligand_D_values = []
+
+    ligand_steps = []
+    for l in range(n_ligands):
+        D = _sample_diffusion_value(ligand_D)
+        ligand_D_values.append(D)
+
+        if ligand_start_positions is None:
+            ligand_positions[l, 0] = _random_position(frame_size, boundary_margin)
+        else:
+            ligand_positions[l, 0] = ligand_start_positions[l]
+
+        if num_steps > 1:
+            ligand_steps.append(
+                generate_diffusion_steps(
+                    num_steps=num_steps - 1,
+                    D1=D,
+                    D2=D,
+                    theta=0.0,
+                    dt=dt,
+                    nposframe=nposframe,
+                )
+            )
+        else:
+            ligand_steps.append(np.zeros((0, 2), dtype=float))
+
+    current_bound_to = [None] * n_ligands
+    active_event_index = [None] * n_ligands
+    binding_events = []
+
+    for t in range(num_steps):
+        occupied_receptors = {
+            receptor_idx
+            for receptor_idx in current_bound_to
+            if receptor_idx is not None
+        }
+
+        for l in range(n_ligands):
+            receptor_idx = current_bound_to[l]
+
+            if receptor_idx is not None and np.random.rand() < p_off:
+                binding_events[active_event_index[l]]["end_subframe"] = t - 1
+                current_bound_to[l] = None
+                active_event_index[l] = None
+                if not allow_multiple_ligands_per_receptor:
+                    occupied_receptors.discard(receptor_idx)
+                receptor_idx = None
+
+            if receptor_idx is not None:
+                ligand_positions[l, t] = receptor_positions[receptor_idx, t]
+                if bound_position_noise > 0:
+                    ligand_positions[l, t] += np.random.normal(
+                        0.0,
+                        bound_position_noise,
+                        size=2,
+                    )
+                if reflect_boundaries:
+                    ligand_positions[l, t] = _reflect_position(
+                        ligand_positions[l, t],
+                        frame_size,
+                    )
+                ligand_states[l, t] = "bound"
+                ligand_bound_to[l, t] = receptor_ids[receptor_idx]
+                continue
+
+            if t > 0:
+                ligand_positions[l, t] = ligand_positions[l, t - 1] + ligand_steps[l][t - 1]
+                if reflect_boundaries:
+                    ligand_positions[l, t] = _reflect_position(
+                        ligand_positions[l, t],
+                        frame_size,
+                    )
+
+            receptor_distances = np.linalg.norm(
+                receptor_positions[:, t] - ligand_positions[l, t],
+                axis=1,
+            )
+            candidate_indices = np.where(receptor_distances <= binding_radius)[0]
+
+            if not allow_multiple_ligands_per_receptor:
+                candidate_indices = np.array([
+                    idx
+                    for idx in candidate_indices
+                    if idx not in occupied_receptors
+                ])
+
+            if candidate_indices.size > 0 and np.random.rand() < p_on:
+                nearest_idx = candidate_indices[
+                    np.argmin(receptor_distances[candidate_indices])
+                ]
+                current_bound_to[l] = nearest_idx
+                occupied_receptors.add(nearest_idx)
+
+                ligand_positions[l, t] = receptor_positions[nearest_idx, t]
+                if bound_position_noise > 0:
+                    ligand_positions[l, t] += np.random.normal(
+                        0.0,
+                        bound_position_noise,
+                        size=2,
+                    )
+                if reflect_boundaries:
+                    ligand_positions[l, t] = _reflect_position(
+                        ligand_positions[l, t],
+                        frame_size,
+                    )
+
+                ligand_states[l, t] = "bound"
+                ligand_bound_to[l, t] = receptor_ids[nearest_idx]
+
+                binding_events.append({
+                    "ligand_id": ligand_ids[l],
+                    "receptor_id": receptor_ids[nearest_idx],
+                    "start_subframe": t,
+                    "end_subframe": None,
+                })
+                active_event_index[l] = len(binding_events) - 1
+
+    for event in binding_events:
+        if event["end_subframe"] is None:
+            event["end_subframe"] = num_steps - 1
+
+        event["start_frame"] = event["start_subframe"] // nposframe
+        event["end_frame"] = event["end_subframe"] // nposframe
+
+    receptor_states = np.full((n_receptors, num_steps), "free", dtype=object)
+    receptor_bound_to = np.full((n_receptors, num_steps), None, dtype=object)
+
+    for r in range(n_receptors):
+        receptor_id = receptor_ids[r]
+        for t in range(num_steps):
+            bound_ligands = [
+                ligand_ids[l]
+                for l in range(n_ligands)
+                if ligand_bound_to[l, t] == receptor_id
+            ]
+            if len(bound_ligands) == 1:
+                receptor_states[r, t] = "bound"
+                receptor_bound_to[r, t] = bound_ligands[0]
+            elif len(bound_ligands) > 1:
+                receptor_states[r, t] = "bound"
+                receptor_bound_to[r, t] = tuple(bound_ligands)
+
+    trajectories = []
+
+    for r in range(n_receptors):
+        intensity = _sample_positive_normal(
+            receptor_intensity_mean,
+            receptor_intensity_std,
+            min_value=0.0,
+        )
+        sigma = _sample_positive_normal(
+            receptor_sigma_mean,
+            receptor_sigma_std,
+            min_value=0.1,
+        )
+        traj = Trajectory(
+            id=receptor_ids[r],
+            start_frame=0,
+            D1_ini=receptor_D_values[r],
+            D2_ini=receptor_D_values[r],
+            theta_ini=0.0,
+            particle_type="receptor",
+            metadata={"role": "receptor"},
+        )
+
+        for t in range(num_steps):
+            traj.add_position(
+                tuple(receptor_positions[r, t]),
+                frame=t,
+                intensity=intensity,
+                sigma=sigma,
+                state=receptor_states[r, t],
+                bound_to=receptor_bound_to[r, t],
+            )
+
+        trajectories.append(traj)
+
+    for l in range(n_ligands):
+        intensity = _sample_positive_normal(
+            ligand_intensity_mean,
+            ligand_intensity_std,
+            min_value=0.0,
+        )
+        sigma = _sample_positive_normal(
+            ligand_sigma_mean,
+            ligand_sigma_std,
+            min_value=0.1,
+        )
+        traj = Trajectory(
+            id=ligand_ids[l],
+            start_frame=0,
+            D1_ini=ligand_D_values[l],
+            D2_ini=ligand_D_values[l],
+            theta_ini=0.0,
+            particle_type="ligand",
+            metadata={"role": "ligand"},
+        )
+
+        for t in range(num_steps):
+            traj.add_position(
+                tuple(ligand_positions[l, t]),
+                frame=t,
+                intensity=intensity,
+                sigma=sigma,
+                state=ligand_states[l, t],
+                bound_to=ligand_bound_to[l, t],
+            )
+
+        trajectories.append(traj)
+
+    if return_events:
+        return trajectories, binding_events
+
+    return trajectories
+
 
 def trajectories_to_global_video(trajectories, nframes, nPosPerFrame, image_props=None):
     """
@@ -300,6 +680,8 @@ def trajectories_to_global_video(trajectories, nframes, nPosPerFrame, image_prop
     props = {
         "particle_intensity": [500, 100],
         "particle_sigma": [1.0, 0.2],
+        "particle_type_props": {},
+        "use_trajectory_sigma": False,
         "NA": 1.46,
         "wavelength": 500e-9,
         "psf_division_factor": 1,
@@ -324,9 +706,9 @@ def trajectories_to_global_video(trajectories, nframes, nPosPerFrame, image_prop
     fwhm_psf = props["wavelength"] / 2 * props["NA"] / psf_div_factor
     gaussian_sigma = upsampling_factor / resolution * fwhm_psf / 2.355
 
-    particle_mean, particle_std = props["particle_intensity"]
     background_mean, background_std = props["background_intensity"]
     poisson_noise = props["poisson_noise"]
+    particle_type_props = props["particle_type_props"]
 
     hr_size = output_size * upsampling_factor
     out_video = np.zeros((nframes, output_size, output_size), dtype=np.float32)
@@ -341,6 +723,19 @@ def trajectories_to_global_video(trajectories, nframes, nPosPerFrame, image_prop
         for traj in trajectories:
             if traj.length() == 0:
                 continue
+
+            type_props = particle_type_props.get(
+                getattr(traj, "particle_type", "particle"),
+                {}
+            )
+            particle_mean, particle_std = type_props.get(
+                "particle_intensity",
+                props["particle_intensity"]
+            )
+            sigma_mean, sigma_std = type_props.get(
+                "particle_sigma",
+                props["particle_sigma"]
+            )
 
 
             for subframe in range(start, end):
@@ -368,11 +763,17 @@ def trajectories_to_global_video(trajectories, nframes, nPosPerFrame, image_prop
                 sigma = traj.get_sigma_at_frame(subframe)
                 if intensity is None:
                     intensity = max(np.random.normal(particle_mean, particle_std), 0.0)
+                if sigma is None:
+                    sigma = max(np.random.normal(sigma_mean, sigma_std), 0.1)
+                if props["use_trajectory_sigma"]:
+                    spot_sigma = max(float(sigma), 1e-6) * upsampling_factor
+                else:
+                    spot_sigma = gaussian_sigma
         
                 spot_intensity = intensity / nPosPerFrame
 
                 frame_spot = gaussian_2d_image_coords(
-                    x, y, gaussian_sigma, hr_size, spot_intensity
+                    x, y, spot_sigma, hr_size, spot_intensity
                 )
 
                 spot_max = np.max(frame_spot)

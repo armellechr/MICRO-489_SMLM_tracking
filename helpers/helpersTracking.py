@@ -5,6 +5,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import math
+import copy
 import torch
 import torch.nn as nn
 
@@ -312,12 +313,12 @@ def localize_peaks_with_gaussian_fitting(
                 and r_squared >= r_squared_threshold
             ):
                 localized_frame_peaks.append(localized_peak)
-                print(
-                    f"[Frame {frame_idx}] Fitted center for peak at "
-                    f"({peak[0]}, {peak[1]}): "
-                    f"({pos_fit[0]:.2f}, {pos_fit[1]:.2f}), "
-                    f"amplitude {amp_fit:.2f}, sigma {sigma_fit:.2f}"
-                )
+                # print(
+                #     f"[Frame {frame_idx}] Fitted center for peak at "
+                #     f"({peak[0]}, {peak[1]}): "
+                #     f"({pos_fit[0]:.2f}, {pos_fit[1]:.2f}), "
+                #     f"amplitude {amp_fit:.2f}, sigma {sigma_fit:.2f}"
+                # )
 
             elif r_squared is None:
                 print(
@@ -523,6 +524,84 @@ def track_peaks_to_trajectories(
 # =============================================================================
 # Full tracking pipeline with detection or detection+localization
 # =============================================================================
+
+def remove_static_peaks(peaks_for_tracking,
+                        static_trajectories,
+                        tolerance=5.0,
+                        verbose=False):
+    """
+    Remove peaks that correspond to static trajectories by matching each
+    static trajectory position to the closest localized peak in the same frame.
+
+    Parameters
+    ----------
+    peaks_for_tracking : list[list]
+        peaks_for_tracking[frame] = list of peaks, each peak is (pos, intensity, ...)
+    static_trajectories : list
+        List of trajectory objects with attributes:
+            - id
+            - start_frame
+            - end_frame
+            - positions (list of (x, y))
+    tolerance : float
+        Maximum allowed distance to consider a peak as belonging to a static trajectory.
+    verbose : bool
+        If True, prints detailed removal logs.
+
+    Returns
+    -------
+    cleaned_peaks : list[list]
+        Deep copy of peaks_for_tracking with static peaks removed.
+    """
+
+    cleaned_peaks = copy.deepcopy(peaks_for_tracking)
+
+    for traj in static_trajectories:
+        start = traj.start_frame
+        end = traj.end_frame
+        positions = traj.positions
+        length = end - start + 1
+
+        removed_count = 0
+
+        for i in range(length):
+            frame_id = start + i
+            traj_pos = np.array(positions[i])
+
+            peak_list = cleaned_peaks[frame_id]
+            if not peak_list:
+                continue
+
+            # Find closest peak
+            closest_idx = None
+            closest_dist = float("inf")
+
+            for idx, peak in enumerate(peak_list):
+                peak_pos = np.array(peak[0])
+                dist = np.linalg.norm(peak_pos - traj_pos)
+                if dist < closest_dist:
+                    closest_dist = dist
+                    closest_idx = idx
+
+            # Remove if within tolerance
+            if closest_dist < tolerance:
+                removed_peak = peak_list.pop(closest_idx)
+                removed_count += 1
+
+                # if verbose:
+                #     print(
+                #         f"[Frame {frame_id}] Removed peak {removed_peak[0]} "
+                #         f"closest to static position {traj_pos.tolist()} "
+                #         f"(dist={closest_dist:.2f})"
+                #     )
+
+        if verbose:
+            print(
+                f"Removed {removed_count} peaks from static trajectory {traj.id} "
+                f"(length {length}, frames {start}–{end})"
+            )
+
+    return cleaned_peaks
 
 def track(
     frames,

@@ -96,9 +96,18 @@ class Simulator:
     # current trajectories are of length nframes * nposframe, but we want to compare with trajectories at frame resolution (nframes)
     def create_GT_trajectories(self, trajectories, nposframe):
         trajectories_GT = copy.deepcopy(trajectories)
+        output_size = self.image_config.get(
+            "output_size",
+            self.simulation_config.get("frame_size", (128, 128))[1],
+        )
+
         for traj in trajectories_GT:
             traj.positions = traj.positions[::nposframe]
-            traj.positions = [(128-pos[1], pos[0]) for pos in traj.positions]
+            traj.intensities = traj.intensities[::nposframe]
+            traj.sigmas = traj.sigmas[::nposframe]
+            traj.states = traj.states[::nposframe]
+            traj.bound_to = traj.bound_to[::nposframe]
+            traj.positions = [(output_size-pos[1], pos[0]) for pos in traj.positions]
             traj.end_frame = traj.start_frame + len(traj.positions) - 1
         return trajectories_GT
 
@@ -185,3 +194,54 @@ class Simulator:
             **kwargs,
         )
     
+
+class LigandReceptorSimulator(Simulator):
+    def __init__(self, simulation_config, image_config=None, seed=None):
+        super().__init__(simulation_config, image_config=image_config, seed=seed)
+        self.binding_events = []
+
+    def run(self):
+        if self.seed is not None:
+            np.random.seed(self.seed)
+
+        self.trajectories_HR, self.binding_events = simulate_ligand_receptor_motion(
+            **self.simulation_config,
+            return_events=True,
+        )
+
+        self.video = trajectories_to_global_video(
+            self.trajectories_HR,
+            nframes=self.simulation_config["nframes"],
+            nPosPerFrame=self.simulation_config["nposframe"],
+            image_props=self.image_config,
+        )
+
+        self.trajectories_GT = self.create_GT_trajectories(
+            self.trajectories_HR,
+            self.simulation_config["nposframe"],
+        )
+
+        self.trajectories_FR = self.create_FR_trajectories(
+            self.trajectories_GT
+        )
+
+        self.frames = self.video.astype(np.float32)
+
+        return self
+
+    def reset(self):
+        super().reset()
+        self.binding_events = []
+        return self
+
+    def get_ligands(self, resolution="GT"):
+        trajectories = self.trajectories_GT if resolution == "GT" else self.trajectories_HR
+        if trajectories is None:
+            raise ValueError("Simulation has not been run yet.")
+        return [traj for traj in trajectories if traj.particle_type == "ligand"]
+
+    def get_receptors(self, resolution="GT"):
+        trajectories = self.trajectories_GT if resolution == "GT" else self.trajectories_HR
+        if trajectories is None:
+            raise ValueError("Simulation has not been run yet.")
+        return [traj for traj in trajectories if traj.particle_type == "receptor"]

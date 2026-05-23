@@ -933,45 +933,375 @@ def show_trajectories(frames, trajectories, frame_id=0, title=None, save_path=No
     plt.show()
 
 
-def linear_trajectories_visualizer(trajectories_new, trajectories_GT):
-    import matplotlib.pyplot as plt
-    plt.figure(figsize=(12, 6))
+def linear_trajectories_visualizer(
+    trajectories_new,
+    trajectories_GT,
+    quality_tolerance=3.0,
+    separate_types=True,
+    show_bound_states=True,
+    show_unassigned=True,
+    show_labels=False,
+    title=None,
+    figsize=None,
+    save_path=None,
+    return_fig=False,
+):
+    """
+    Visualize tracking quality as temporal bars aligned to ground truth.
 
-    for traj in trajectories_GT:
-        if traj.length() > 0:
-            plt.hlines(
-                traj.id,
-                traj.start_frame,
-                traj.end_frame + 1,
-                colors=traj.color,
-                linestyles='solid',
-                label='GT' if traj.id == 0 else ""
+    Ground-truth trajectories are shown as pale horizontal bars. Estimated
+    trajectories are overlaid on the assigned GT row and colored by their mean
+    localization error on overlapping frames.
+
+    Parameters
+    ----------
+    trajectories_new : list[Trajectory]
+        Tracked trajectories after assignment to GT ids.
+    trajectories_GT : list[Trajectory]
+        Ground-truth trajectories.
+    quality_tolerance : float
+        Error in pixels below which a tracked segment is counted as good.
+    separate_types : bool
+        If True, create separate panels for receptors and ligands when
+        ``particle_type`` metadata is available.
+    show_bound_states : bool
+        If True, draw a small purple underline where GT states are "bound".
+    show_unassigned : bool
+        If True, display unassigned tracks in a separate panel.
+    show_labels : bool
+        If True, annotate tracked segments with error and coverage.
+    title : str or None
+        Optional figure title.
+    figsize : tuple or None
+        Optional matplotlib figure size.
+    save_path : str or None
+        Optional path where the figure is saved.
+    return_fig : bool
+        If True, return ``(fig, axes)``. Defaults to False to keep notebook
+        output clean when the function is called as the last line of a cell.
+
+    Returns
+    -------
+    tuple or None
+        ``(fig, axes)`` if ``return_fig=True``, otherwise ``None``.
+    """
+    from matplotlib.lines import Line2D
+
+    def _particle_type(traj):
+        return getattr(traj, "particle_type", "particle") or "particle"
+
+    def _ordered_types(types):
+        preferred = ["receptor", "ligand", "particle"]
+        ordered = [t for t in preferred if t in types]
+        ordered += sorted(t for t in types if t not in preferred)
+        return ordered
+
+    def _overlap_interval(traj_new, traj_gt):
+        start = max(traj_new.start_frame, traj_gt.start_frame)
+        end = min(traj_new.end_frame, traj_gt.end_frame)
+        if start > end:
+            return None
+        return start, end
+
+    def _overlap_distances(traj_new, traj_gt):
+        interval = _overlap_interval(traj_new, traj_gt)
+        if interval is None:
+            return []
+
+        start, end = interval
+        distances = []
+        for frame in range(start, end + 1):
+            pos_new = traj_new.get_position_at_frame(frame)
+            pos_gt = traj_gt.get_position_at_frame(frame)
+
+            if pos_new is None or pos_gt is None:
+                continue
+
+            distances.append(
+                float(np.linalg.norm(np.asarray(pos_new) - np.asarray(pos_gt)))
             )
+
+        return distances
+
+    def _quality(mean_error):
+        if not np.isfinite(mean_error):
+            return "#6b7280", "no overlap"
+        if mean_error <= quality_tolerance:
+            return "#2ca25f", f"err <= {quality_tolerance:g} px"
+        if mean_error <= 2 * quality_tolerance:
+            return "#f59e0b", f"err <= {2 * quality_tolerance:g} px"
+        return "#dc2626", f"err > {2 * quality_tolerance:g} px"
+
+    def _bound_runs(traj):
+        states = getattr(traj, "states", None)
+        if not states:
+            return []
+
+        runs = []
+        current_start = None
+        for frame, state in zip(traj.frames(), states):
+            is_bound = state == "bound"
+            if is_bound and current_start is None:
+                current_start = frame
+            elif not is_bound and current_start is not None:
+                runs.append((current_start, frame))
+                current_start = None
+
+        if current_start is not None:
+            runs.append((current_start, traj.end_frame + 1))
+
+        return runs
+
+    gt_by_id = {
+        traj.id: traj
+        for traj in trajectories_GT
+        if traj.id is not None and traj.length() > 0
+    }
+
+    gt_types = {_particle_type(traj) for traj in gt_by_id.values()}
+    panel_types = (_ordered_types(gt_types) or ["all"]) if separate_types else ["all"]
+
+    assigned_tracks = []
+    unassigned_tracks = []
 
     for traj in trajectories_new:
-        if traj.length() > 0 and traj.id is not None and traj.id != -1:
-            plt.hlines(
-                traj.id + 0.2,
-                traj.start_frame,
-                traj.end_frame + 1,
-                colors=traj.color,
-                linestyles='dashed',
-                label='New' if traj.id == 0 else ""
+        if traj.length() == 0:
+            continue
+
+        if traj.id is None or traj.id == -1 or traj.id not in gt_by_id:
+            unassigned_tracks.append(traj)
+            continue
+
+        gt_traj = gt_by_id[traj.id]
+        distances = _overlap_distances(traj, gt_traj)
+        mean_error = float(np.mean(distances)) if distances else np.inf
+        overlap_length = len(distances)
+        gt_coverage = overlap_length / gt_traj.length() if gt_traj.length() > 0 else 0.0
+        track_coverage = overlap_length / traj.length() if traj.length() > 0 else 0.0
+
+        assigned_tracks.append({
+            "traj": traj,
+            "gt": gt_traj,
+            "type": _particle_type(gt_traj),
+            "mean_error": mean_error,
+            "gt_coverage": gt_coverage,
+            "track_coverage": track_coverage,
+        })
+
+    include_unassigned = show_unassigned and len(unassigned_tracks) > 0
+    n_panels = len(panel_types) + int(include_unassigned)
+
+    if figsize is None:
+        total_rows = len(trajectories_GT) + (1 if include_unassigned else 0)
+        figsize = (14, max(4.0, 1.0 + 0.55 * total_rows))
+
+    fig, axes = plt.subplots(
+        n_panels,
+        1,
+        figsize=figsize,
+        sharex=True,
+        squeeze=False,
+        gridspec_kw={"height_ratios": [1] * n_panels},
+    )
+    axes = axes.ravel()
+
+    max_frame = 0
+    for traj in list(trajectories_GT) + list(trajectories_new):
+        if traj.length() > 0:
+            max_frame = max(max_frame, traj.end_frame + 1)
+
+    legend_handles = [
+        Line2D([0], [0], color="#cbd5e1", linewidth=8, label="Ground truth"),
+        Line2D([0], [0], color="#2ca25f", linewidth=3, linestyle="--",
+               label=f"Tracked, err <= {quality_tolerance:g} px"),
+        Line2D([0], [0], color="#f59e0b", linewidth=3, linestyle="--",
+               label=f"Tracked, err <= {2 * quality_tolerance:g} px"),
+        Line2D([0], [0], color="#dc2626", linewidth=3, linestyle="--",
+               label=f"Tracked, err > {2 * quality_tolerance:g} px"),
+        Line2D([0], [0], color="#7c3aed", linewidth=2,
+               label="GT bound state"),
+    ]
+
+    for ax_idx, panel_type in enumerate(panel_types):
+        ax = axes[ax_idx]
+
+        if panel_type == "all":
+            gt_panel = list(gt_by_id.values())
+            track_panel = assigned_tracks
+            panel_title = "All particles"
+        else:
+            gt_panel = [
+                traj for traj in gt_by_id.values()
+                if _particle_type(traj) == panel_type
+            ]
+            track_panel = [
+                row for row in assigned_tracks
+                if row["type"] == panel_type
+            ]
+            panel_title = panel_type.capitalize() + "s"
+
+        gt_panel = sorted(gt_panel, key=lambda traj: traj.id)
+        y_by_id = {traj.id: i for i, traj in enumerate(gt_panel)}
+
+        good_ids = {
+            row["gt"].id
+            for row in track_panel
+            if row["mean_error"] <= quality_tolerance
+        }
+        good_rows = [
+            row for row in track_panel
+            if row["mean_error"] <= quality_tolerance
+        ]
+
+        mean_error = (
+            np.mean([row["mean_error"] for row in good_rows])
+            if good_rows else np.nan
+        )
+        mean_coverage = (
+            np.mean([row["gt_coverage"] for row in good_rows])
+            if good_rows else np.nan
+        )
+
+        stats = (
+            f"recovered {len(good_ids)}/{len(gt_panel)}"
+            if len(gt_panel) > 0 else "no GT"
+        )
+        if np.isfinite(mean_error):
+            stats += f", mean err {mean_error:.2f} px"
+        if np.isfinite(mean_coverage):
+            stats += f", mean coverage {100 * mean_coverage:.0f}%"
+
+        for gt_traj in gt_panel:
+            y = y_by_id[gt_traj.id]
+            ax.hlines(
+                y,
+                gt_traj.start_frame,
+                gt_traj.end_frame + 1,
+                colors="#cbd5e1",
+                linewidth=8,
+                zorder=1,
             )
 
-    plt.xlabel('Frame Number')
-    plt.ylabel('Trajectory ID')
+            if show_bound_states:
+                for start, end in _bound_runs(gt_traj):
+                    ax.hlines(
+                        y - 0.24,
+                        start,
+                        end,
+                        colors="#7c3aed",
+                        linewidth=2,
+                        alpha=0.75,
+                        zorder=2,
+                    )
 
-    all_ids = [traj.id for traj in trajectories_GT if traj.length() > 0] + \
-              [traj.id for traj in trajectories_new if traj.length() > 0 and traj.id is not None and traj.id != -1]
+        duplicate_count = {}
+        for row in track_panel:
+            traj = row["traj"]
+            gt_traj = row["gt"]
+            y = y_by_id.get(gt_traj.id)
+            if y is None:
+                continue
 
-    if all_ids:
-        plt.ylim(-1, max(all_ids) + 1)
+            key = (panel_type, gt_traj.id)
+            duplicate_idx = duplicate_count.get(key, 0)
+            duplicate_count[key] = duplicate_idx + 1
+            y_offset = 0.18 + 0.08 * min(duplicate_idx, 3)
 
-    plt.title('Comparison of GT and experimental trajectories')
-    plt.legend()
-    plt.grid()
+            color, _ = _quality(row["mean_error"])
+            ax.hlines(
+                y + y_offset,
+                traj.start_frame,
+                traj.end_frame + 1,
+                colors=color,
+                linestyles="--",
+                linewidth=3,
+                zorder=3,
+            )
+            ax.plot(
+                [traj.start_frame, traj.end_frame + 1],
+                [y + y_offset, y + y_offset],
+                marker="|",
+                color=color,
+                linestyle="None",
+                markersize=8,
+                zorder=4,
+            )
+
+            if show_labels:
+                label = (
+                    f"{row['mean_error']:.1f}px, "
+                    f"{100 * row['gt_coverage']:.0f}%"
+                )
+                ax.text(
+                    traj.end_frame + 1,
+                    y + y_offset,
+                    label,
+                    va="center",
+                    ha="left",
+                    fontsize=8,
+                    color=color,
+                )
+
+        tick_labels = [
+            f"{_particle_type(traj)[0].upper()}{traj.id}"
+            for traj in gt_panel
+        ]
+
+        ax.set_yticks(range(len(gt_panel)))
+        ax.set_yticklabels(tick_labels)
+        ax.set_ylim(-0.6, max(len(gt_panel) - 0.2, 0.6))
+        ax.set_ylabel("GT id")
+        ax.set_title(f"{panel_title}: {stats}", loc="left", fontsize=11)
+        ax.grid(axis="x", alpha=0.25)
+        ax.grid(axis="y", alpha=0.12)
+
+    if include_unassigned:
+        ax = axes[-1]
+        unassigned_tracks = sorted(
+            unassigned_tracks,
+            key=lambda traj: (traj.start_frame, traj.end_frame),
+        )
+        for idx, traj in enumerate(unassigned_tracks):
+            ax.hlines(
+                idx,
+                traj.start_frame,
+                traj.end_frame + 1,
+                colors="#6b7280",
+                linestyles=":",
+                linewidth=2.5,
+            )
+        ax.set_yticks(range(len(unassigned_tracks)))
+        ax.set_yticklabels([f"U{i}" for i in range(len(unassigned_tracks))])
+        ax.set_ylim(-0.6, max(len(unassigned_tracks) - 0.2, 0.6))
+        ax.set_ylabel("Track")
+        ax.set_title(f"Unassigned tracks: {len(unassigned_tracks)}", loc="left", fontsize=11)
+        ax.grid(axis="x", alpha=0.25)
+
+    axes[-1].set_xlabel("Frame")
+    for ax in axes:
+        ax.set_xlim(0, max(max_frame, 1))
+
+    if title is None:
+        title = "Tracking quality by particle type"
+    fig.suptitle(title, y=0.995)
+    fig.legend(
+        handles=legend_handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.965),
+        ncol=min(len(legend_handles), 5),
+        frameon=False,
+    )
+
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
+
+    if save_path is not None:
+        fig.savefig(save_path, dpi=200, bbox_inches="tight", pad_inches=0.05)
+
     plt.show()
+    if return_fig:
+        return fig, axes
+
+    return None
 
 from matplotlib.animation import FuncAnimation
 from IPython.display import HTML

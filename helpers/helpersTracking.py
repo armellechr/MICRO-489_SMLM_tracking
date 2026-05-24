@@ -415,13 +415,18 @@ def track_peaks_to_trajectories(
     max_distance=5,
     min_length=5,
     algorithm='hungarian',
-    cost_function=None
+    cost_function=None,
+    max_gap=0,
 ):
     """
     General frame-to-frame tracking using detections of the form:
         ((x, y), intensity)
     or
         (x, y)
+
+    ``max_gap`` keeps unmatched trajectories alive for a few frames so fast or
+    dim particles can be reconnected after missed detections. The spatial gate
+    grows as ``sqrt(number_of_elapsed_frames)`` across a gap.
     """
     if len(peaks) == 0:
         return [], 0.0
@@ -443,8 +448,16 @@ def track_peaks_to_trajectories(
             current_detections.append((pos, amp, det_sigma))
 
         if len(current_detections) == 0:
-            active = []
+            active = [
+                idx for idx in active
+                if f - trajectories[idx].end_frame <= max_gap
+            ]
             continue
+
+        active = [
+            idx for idx in active
+            if f - trajectories[idx].end_frame - 1 <= max_gap
+        ]
 
         # initialize all detections if no active tracks
         if len(active) == 0:
@@ -460,6 +473,14 @@ def track_peaks_to_trajectories(
             continue
 
         active_trajectories = [trajectories[idx] for idx in active]
+        if max_distance is None:
+            row_max_distances = None
+        else:
+            frame_gaps = np.array(
+                [max(f - trajectories[idx].end_frame, 1) for idx in active],
+                dtype=float,
+            )
+            row_max_distances = max_distance * np.sqrt(frame_gaps)
 
         if cost_function is None:
             cost_function = PeakToPeak.default()
@@ -468,7 +489,7 @@ def track_peaks_to_trajectories(
             active_trajectories,
             current_detections,
             cost_function=cost_function,
-            max_distance=max_distance,
+            max_distance=row_max_distances,
         )
 
         gated_cost = cost_matrix.copy()
@@ -476,9 +497,15 @@ def track_peaks_to_trajectories(
         if algorithm == 'hungarian':
             min_cost_frame, assignment = hungarian(gated_cost)
         elif algorithm == 'local_nn':
-            min_cost_frame, assignment = local_nn_assignment(gated_cost, max_distance=max_distance)
+            assignment_threshold = (
+                np.inf if row_max_distances is None else np.max(row_max_distances)
+            )
+            min_cost_frame, assignment = local_nn_assignment(gated_cost, max_distance=assignment_threshold)
         elif algorithm == 'global_nn':
-            min_cost_frame, assignment = global_nn_assignment(gated_cost, max_distance=max_distance)
+            assignment_threshold = (
+                np.inf if row_max_distances is None else np.max(row_max_distances)
+            )
+            min_cost_frame, assignment = global_nn_assignment(gated_cost, max_distance=assignment_threshold)
         else:
             raise ValueError("Invalid algorithm. Choose 'hungarian', 'local_nn', or 'global_nn'.")
         
@@ -486,6 +513,7 @@ def track_peaks_to_trajectories(
 
         used = np.zeros(len(current_detections), dtype=bool)
         new_active = []
+        matched_active = set()
 
         for row_idx, det_idx in enumerate(assignment):
             traj_idx = active[row_idx]
@@ -506,6 +534,13 @@ def track_peaks_to_trajectories(
             )
             used[det_idx] = True
             new_active.append(traj_idx)
+            matched_active.add(traj_idx)
+
+        for traj_idx in active:
+            if traj_idx in matched_active:
+                continue
+            if f - trajectories[traj_idx].end_frame <= max_gap:
+                new_active.append(traj_idx)
 
         for j, det in enumerate(current_detections):
             if not used[j]:
@@ -516,10 +551,180 @@ def track_peaks_to_trajectories(
                 trajectories.append(traj)
                 new_active.append(traj_id)
 
-        active = new_active
+        active = list(dict.fromkeys(new_active))
 
     trajectories = [traj for traj in trajectories if traj.length() >= min_length]
     return trajectories, min_cost_frames 
+
+
+def _trajectory_first_intensity(trajectory):
+    return trajectory.intensities[0] if trajectory.intensities else None
+
+
+def _trajectory_first_sigma(trajectory):
+    return trajectory.sigmas[0] if trajectory.sigmas else None
+
+
+def _merge_trajectory_chain(chain, new_id):
+    merged = copy.deepcopy(chain[0])
+    merged.id = new_id
+
+    for fragment in chain[1:]:
+        for frame, position, intensity, sigma, state, bound_to in zip(
+            fragment.frames(),
+            fragment.positions,
+            fragment.intensities,
+            fragment.sigmas,
+            fragment.states,
+            fragment.bound_to,
+        ):
+            merged.add_position(
+                position,
+                frame=frame,
+                intensity=intensity,
+                sigma=sigma,
+                state=state,
+                bound_to=bound_to,
+            )
+
+    return merged
+
+
+def stitch_trajectory_fragments(
+    trajectories,
+    max_gap=4,
+    base_distance=10.0,
+    distance_weight=1.0,
+    gap_weight=0.1,
+    intensity_weight=0.2,
+    sigma_weight=0.2,
+    intensity_scale=500.0,
+    sigma_scale=0.75,
+    use_intensity=True,
+    use_sigma=True,
+    max_link_cost=2.0,
+    max_iterations=5,
+    verbose=False,
+):
+    """
+    Stitch temporally separated trajectory fragments before GT assignment.
+
+    Fragments are linked only if they do not overlap in time and the gap is no
+    larger than ``max_gap`` missed frames. The spatial gate grows as
+    ``base_distance * sqrt(elapsed_frames)``, which is a simple Brownian-motion
+    prior for fast ligands.
+    """
+    stitched = [copy.deepcopy(traj) for traj in trajectories if traj.length() > 0]
+
+    if len(stitched) <= 1:
+        return stitched
+
+    for iteration in range(max_iterations):
+        n = len(stitched)
+        invalid_cost = 1e6
+        cost_matrix = np.full((n, n), invalid_cost, dtype=float)
+
+        for i, tail in enumerate(stitched):
+            tail_pos = np.asarray(tail.last_position(), dtype=float)
+            tail_intensity = tail.last_intensity()
+            tail_sigma = tail.last_sigma()
+
+            for j, head in enumerate(stitched):
+                if i == j:
+                    continue
+
+                elapsed_frames = head.start_frame - tail.end_frame
+                missing_frames = elapsed_frames - 1
+
+                if elapsed_frames <= 0 or missing_frames > max_gap:
+                    continue
+
+                head_pos = np.asarray(head.positions[0], dtype=float)
+                allowed_distance = base_distance * np.sqrt(elapsed_frames)
+                distance = np.linalg.norm(head_pos - tail_pos)
+
+                if distance > allowed_distance:
+                    continue
+
+                cost = distance_weight * (distance / allowed_distance)
+                cost += gap_weight * missing_frames
+
+                if use_intensity:
+                    head_intensity = _trajectory_first_intensity(head)
+                    if tail_intensity is not None and head_intensity is not None:
+                        cost += intensity_weight * (
+                            abs(tail_intensity - head_intensity) / intensity_scale
+                        )
+
+                if use_sigma:
+                    head_sigma = _trajectory_first_sigma(head)
+                    if tail_sigma is not None and head_sigma is not None:
+                        cost += sigma_weight * (
+                            abs(tail_sigma - head_sigma) / sigma_scale
+                        )
+
+                if cost <= max_link_cost:
+                    cost_matrix[i, j] = cost
+
+        if not np.any(cost_matrix < invalid_cost):
+            break
+
+        _, assignment = hungarian(cost_matrix)
+        successor = {}
+        predecessors = set()
+
+        for i, j in enumerate(assignment):
+            if j == -1 or cost_matrix[i, j] >= invalid_cost:
+                continue
+            successor[i] = int(j)
+            predecessors.add(int(j))
+
+        if len(successor) == 0:
+            break
+
+        merged = []
+        visited = set()
+        starts = [i for i in range(n) if i not in predecessors]
+
+        for start in starts:
+            if start in visited:
+                continue
+
+            chain_indices = []
+            current = start
+
+            while current not in visited:
+                visited.add(current)
+                chain_indices.append(current)
+                if current not in successor:
+                    break
+                current = successor[current]
+
+            chain = [stitched[idx] for idx in chain_indices]
+            merged.append(_merge_trajectory_chain(chain, new_id=len(merged)))
+
+        for idx in range(n):
+            if idx not in visited:
+                orphan = copy.deepcopy(stitched[idx])
+                orphan.id = len(merged)
+                merged.append(orphan)
+
+        if verbose:
+            print(
+                f"Stitch iteration {iteration + 1}: "
+                f"{n} -> {len(merged)} trajectories "
+                f"({len(successor)} links)"
+            )
+
+        if len(merged) == n:
+            break
+
+        stitched = merged
+
+    for idx, traj in enumerate(stitched):
+        traj.id = idx
+
+    return stitched
 
 # =============================================================================
 # Full tracking pipeline with detection or detection+localization
@@ -557,16 +762,10 @@ def remove_static_peaks(peaks_for_tracking,
     cleaned_peaks = copy.deepcopy(peaks_for_tracking)
 
     for traj in static_trajectories:
-        start = traj.start_frame
-        end = traj.end_frame
-        positions = traj.positions
-        length = end - start + 1
-
         removed_count = 0
 
-        for i in range(length):
-            frame_id = start + i
-            traj_pos = np.array(positions[i])
+        for frame_id, position in zip(traj.frames(), traj.positions):
+            traj_pos = np.array(position)
 
             peak_list = cleaned_peaks[frame_id]
             if not peak_list:
@@ -596,6 +795,9 @@ def remove_static_peaks(peaks_for_tracking,
                 #     )
 
         if verbose:
+            length = traj.length()
+            start = traj.start_frame
+            end = traj.end_frame
             print(
                 f"Removed {removed_count} peaks from static trajectory {traj.id} "
                 f"(length {length}, frames {start}–{end})"
@@ -610,6 +812,12 @@ def track(
     detection_threshold=None,
     max_distance=10,
     min_length=5,
+    max_gap=0,
+    stitch_fragments=False,
+    stitch_max_gap=4,
+    stitch_base_distance=10.0,
+    stitch_kwargs=None,
+    verbose_stitching=False,
     r_squared_threshold=0.5,
     algo_peak2peak="hungarian",
     cost_func_peak2peak=None,
@@ -636,6 +844,10 @@ def track(
         Maximum allowed distance for frame-to-frame linking.
     min_length : int, optional
         Minimum trajectory length retained after peak-to-peak tracking.
+    max_gap : int, optional
+        Number of missed frames allowed before a track is terminated.
+    stitch_fragments : bool, optional
+        If True, stitch compatible trajectory fragments before GT assignment.
     r_squared_threshold : float, optional
         Minimum Gaussian fit quality required to keep a localized peak.
     algo_peak2peak : {"hungarian", "local_nn", "global_nn"}, optional
@@ -704,7 +916,18 @@ def track(
         min_length=min_length,
         algorithm=algo_peak2peak,
         cost_function=cost_func_peak2peak,
+        max_gap=max_gap,
     )
+
+    if stitch_fragments and len(trajectories_output) > 0:
+        stitch_kwargs = stitch_kwargs or {}
+        trajectories_output = stitch_trajectory_fragments(
+            trajectories_output,
+            max_gap=stitch_max_gap,
+            base_distance=stitch_base_distance,
+            verbose=verbose_stitching,
+            **stitch_kwargs,
+        )
 
     if len(trajectories_output) == 0:
         return [], cost_peak2peak, [], np.inf
@@ -784,6 +1007,12 @@ def track_from_peaks(
     trajectories_GT, 
     max_distance=10, 
     min_length=5, 
+    max_gap=0,
+    stitch_fragments=False,
+    stitch_max_gap=4,
+    stitch_base_distance=10.0,
+    stitch_kwargs=None,
+    verbose_stitching=False,
     algo_peak2peak="hungarian", 
     cost_func_peak2peak=None, 
     algo_traj2traj="hungarian", 
@@ -796,7 +1025,18 @@ def track_from_peaks(
         min_length=min_length,
         algorithm=algo_peak2peak,
         cost_function=cost_func_peak2peak,
+        max_gap=max_gap,
     )
+
+    if stitch_fragments and len(trajectories_output) > 0:
+        stitch_kwargs = stitch_kwargs or {}
+        trajectories_output = stitch_trajectory_fragments(
+            trajectories_output,
+            max_gap=stitch_max_gap,
+            base_distance=stitch_base_distance,
+            verbose=verbose_stitching,
+            **stitch_kwargs,
+        )
 
     if len(trajectories_output) == 0:
         return [], cost_peak2peak, [], np.inf

@@ -291,13 +291,19 @@ def compute_cost_matrix_tracks_to_detections(
 
     for i, traj in enumerate(active_trajectories):
         last_pos = np.asarray(traj.last_position(), dtype=float)
+        if max_distance is None:
+            row_max_distance = None
+        elif np.isscalar(max_distance):
+            row_max_distance = float(max_distance)
+        else:
+            row_max_distance = float(max_distance[i])
 
         for j, det in enumerate(current_detections):
             pos = np.asarray(det[0], dtype=float)
 
             spatial_dist = np.linalg.norm(last_pos - pos)
 
-            if max_distance is not None and spatial_dist > max_distance:
+            if row_max_distance is not None and spatial_dist > row_max_distance:
                 continue
 
             cost = cost_function(traj, det)

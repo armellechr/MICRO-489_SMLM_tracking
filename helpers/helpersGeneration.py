@@ -16,6 +16,7 @@ class Trajectory:
     
         self.id = id
         self.positions = []
+        self.position_frames = []
         self.intensities = []
         self.sigmas = []
         self.states = []
@@ -36,6 +37,7 @@ class Trajectory:
 
         if initial_position is not None:
             self.positions.append(tuple(initial_position))
+            self.position_frames.append(start_frame)
             self.intensities.append(initial_intensity)
             self.sigmas.append(initial_sigma)
             self.states.append(initial_state)
@@ -61,18 +63,20 @@ class Trajectory:
             self.start_frame = frame
             self.end_frame = frame
             self.positions.append(tuple(position))
+            self.position_frames.append(frame)
             self.intensities.append(intensity)
             self.sigmas.append(sigma)
             self.states.append(state)
             self.bound_to.append(bound_to)
             return
 
-        if frame != self.end_frame + 1:
+        if frame <= self.end_frame:
             raise ValueError(
-            f"Trajectory {self.id}: expected frame {self.end_frame + 1}, got {frame}"
+            f"Trajectory {self.id}: expected frame after {self.end_frame}, got {frame}"
         )
 
         self.positions.append(tuple(position))
+        self.position_frames.append(frame)
         self.intensities.append(intensity)
         self.sigmas.append(sigma)
         self.states.append(state)
@@ -97,29 +101,56 @@ class Trajectory:
     def get_position_at_frame(self, frame):
         if frame < self.start_frame or frame > self.end_frame:
             return None
+        if hasattr(self, "position_frames") and len(self.position_frames) == len(self.positions):
+            try:
+                return self.positions[self.position_frames.index(frame)]
+            except ValueError:
+                return None
         return self.positions[frame - self.start_frame]
 
     def get_intensity_at_frame(self, frame):
         if frame < self.start_frame or frame > self.end_frame:
             return None
+        if hasattr(self, "position_frames") and len(self.position_frames) == len(self.intensities):
+            try:
+                return self.intensities[self.position_frames.index(frame)]
+            except ValueError:
+                return None
         return self.intensities[frame - self.start_frame]
     
     def get_sigma_at_frame(self, frame):
         if frame < self.start_frame or frame > self.end_frame:
             return None
+        if hasattr(self, "position_frames") and len(self.position_frames) == len(self.sigmas):
+            try:
+                return self.sigmas[self.position_frames.index(frame)]
+            except ValueError:
+                return None
         return self.sigmas[frame - self.start_frame]
 
     def get_state_at_frame(self, frame):
         if frame < self.start_frame or frame > self.end_frame:
             return None
+        if hasattr(self, "position_frames") and len(self.position_frames) == len(self.states):
+            try:
+                return self.states[self.position_frames.index(frame)]
+            except ValueError:
+                return None
         return self.states[frame - self.start_frame]
 
     def get_bound_to_at_frame(self, frame):
         if frame < self.start_frame or frame > self.end_frame:
             return None
+        if hasattr(self, "position_frames") and len(self.position_frames) == len(self.bound_to):
+            try:
+                return self.bound_to[self.position_frames.index(frame)]
+            except ValueError:
+                return None
         return self.bound_to[frame - self.start_frame]
 
     def frames(self):
+        if hasattr(self, "position_frames") and len(self.position_frames) == len(self.positions):
+            return list(self.position_frames)
         return list(range(self.start_frame, self.end_frame + 1))
 
     def last_position(self):
@@ -836,12 +867,10 @@ def show_trajectory(frames, trajectories, traj_id=0, frame_id=0, save_path=None)
     fig, ax = plt.subplots(figsize=(6, 6))
     ax.imshow(frames[frame_id], cmap="gray", vmin=0, vmax=5000)
 
-    if traj.start_frame <= frame_id <= traj.end_frame:
-        valid_positions = traj.positions[:frame_id - traj.start_frame + 1]
-    elif frame_id > traj.end_frame:
-        valid_positions = traj.positions
-    else:
-        valid_positions = []
+    valid_positions = [
+        pos for frame, pos in zip(traj.frames(), traj.positions)
+        if frame <= frame_id
+    ]
 
     if len(valid_positions) > 1:
         positions = np.array(valid_positions)
@@ -899,10 +928,10 @@ def show_trajectories(frames, trajectories, frame_id=0, title=None, save_path=No
         if frame_id < traj.start_frame:
             continue
 
-        if frame_id <= traj.end_frame:
-            valid_positions = traj.positions[:frame_id - traj.start_frame + 1]
-        else:
-            valid_positions = traj.positions
+        valid_positions = [
+            pos for frame, pos in zip(traj.frames(), traj.positions)
+            if frame <= frame_id
+        ]
 
         if len(valid_positions) > 1:
             positions = np.array(valid_positions)

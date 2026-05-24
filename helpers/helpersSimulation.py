@@ -103,6 +103,9 @@ class Simulator:
 
         for traj in trajectories_GT:
             traj.positions = traj.positions[::nposframe]
+            traj.position_frames = list(
+                range(traj.start_frame, traj.start_frame + len(traj.positions))
+            )
             traj.intensities = traj.intensities[::nposframe]
             traj.sigmas = traj.sigmas[::nposframe]
             traj.states = traj.states[::nposframe]

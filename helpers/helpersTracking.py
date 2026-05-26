@@ -94,12 +94,17 @@ class PeakToPeak(nn.Module):
         self.return_breakdown = return_breakdown
 
     @classmethod
-    def default(cls):
+    def default(cls, distance_norm=None, intensity_norm=None, sigma_norm=None):
+        """Recommended peak-to-peak cost from CostExperiment."""
+        distance_norm = resolve_cost_norm(distance_norm, DEFAULT_COST_DISTANCE_NORM)
+        intensity_norm = resolve_cost_norm(intensity_norm, DEFAULT_COST_INTENSITY_NORM)
+        sigma_norm = resolve_cost_norm(sigma_norm, DEFAULT_COST_SIGMA_NORM)
+
         return cls(
             terms={
-                "distance": DistanceTerm(weight=0.5, norm=0.25 * 128),
-                "intensity": IntensityTerm(weight=0.4, norm=650),
-                "sigma": SigmaTerm(weight=0.1, norm=2.0),
+                "distance": DistanceTerm(weight=0.5, norm=distance_norm),
+                "intensity": IntensityTerm(weight=0.4, norm=intensity_norm),
+                "sigma": SigmaTerm(weight=0.1, norm=sigma_norm),
             }
         )
 
@@ -241,6 +246,17 @@ def fit_gaussian_to_peak(frame, peak, verbose=False):
     return row_fit_img, col_fit_img, A_fit, sigma_fit, B_fit, r_squared
 
 
+def _format_peak_for_log(peak):
+    """Return a safe text representation for possibly malformed peak values."""
+    if peak is None:
+        return "None"
+
+    try:
+        return f"({peak[0]}, {peak[1]})"
+    except (TypeError, IndexError):
+        return repr(peak)
+
+
 def localize_peaks_with_gaussian_fitting(
     frames,
     detected_peaks,
@@ -266,7 +282,7 @@ def localize_peaks_with_gaussian_fitting(
     r_squared_threshold : float, optional
         Minimum coefficient of determination required to keep a fitted peak.
     verbose : bool, optional
-        Currently unused. Kept for API compatibility.
+        If True, print details about skipped peaks and failed fits.
     visualization : bool, optional
         If True, visualize one selected Gaussian fit.
     visualization_peak_idx : int, optional
@@ -280,38 +296,140 @@ def localize_peaks_with_gaussian_fitting(
     """
     localized_peaks = []
 
+    if frames is None:
+        return localized_peaks
+
+    if detected_peaks is None:
+        return [[] for _ in frames]
+
+    try:
+        r_squared_threshold = float(r_squared_threshold)
+    except (TypeError, ValueError):
+        print("Got invalid r_squared_threshold. Setting to default value of 0.5.")
+        r_squared_threshold = 0.5
+
+    if (
+        not np.isfinite(r_squared_threshold)
+        or r_squared_threshold < 0.0
+        or r_squared_threshold > 1.0
+    ):
+        print("Got invalid r_squared_threshold. Setting to default value of 0.5.")
+        r_squared_threshold = 0.5
+
     for frame_idx, (frame, peaks) in enumerate(zip(frames, detected_peaks)):
         localized_frame_peaks = []
 
-        for peak_idx, peak in enumerate(peaks):
-            fitted = fit_gaussian_to_peak(frame, peak, verbose=verbose)
+        if frame is None:
+            if verbose:
+                print(f"[Frame {frame_idx}] Missing frame; skipping localization.")
+            localized_peaks.append(localized_frame_peaks)
+            continue
 
-            pos_fit = (fitted[0], fitted[1]) if fitted is not None else None
-            A_fit = fitted[2] if fitted is not None else None
-            sigma_fit = fitted[3] if fitted is not None else None
-            r_squared = fitted[5] if fitted is not None else None
+        if peaks is None:
+            if verbose:
+                print(f"[Frame {frame_idx}] No detected peaks; skipping localization.")
+            localized_peaks.append(localized_frame_peaks)
+            continue
 
-            amp_fit = (
-                A_fit / (2 * np.pi * sigma_fit**2)
-                if A_fit is not None and sigma_fit is not None
-                else None
-            )
-
-            localized_peak = (
-                (pos_fit, amp_fit, sigma_fit, r_squared)
-                if (
-                    pos_fit is not None
-                    and amp_fit is not None
-                    and sigma_fit is not None
+        try:
+            peak_iterator = enumerate(peaks)
+        except TypeError:
+            if verbose:
+                print(
+                    f"[Frame {frame_idx}] Invalid peak list {repr(peaks)}; "
+                    "skipping localization."
                 )
-                else None
-            )
+            localized_peaks.append(localized_frame_peaks)
+            continue
+
+        for peak_idx, peak in peak_iterator:
+            peak_label = _format_peak_for_log(peak)
+
+            if peak is None:
+                if verbose:
+                    print(f"[Frame {frame_idx}] Missing peak; skipping localization.")
+                continue
+
+            try:
+                fitted = fit_gaussian_to_peak(frame, peak, verbose=verbose)
+            except (TypeError, IndexError, AttributeError):
+                if verbose:
+                    print(
+                        f"[Frame {frame_idx}] Invalid peak {peak_label}; "
+                        "skipping localization."
+                    )
+                continue
+
+            if fitted is None:
+                if verbose:
+                    print(
+                        f"[Frame {frame_idx}] No computed R-squared for peak at "
+                        f"{peak_label}."
+                    )
+                continue
+
+            try:
+                row_fit, col_fit, A_fit, sigma_fit, _, r_squared = fitted
+            except (TypeError, ValueError):
+                if verbose:
+                    print(
+                        f"[Frame {frame_idx}] Invalid Gaussian fit for peak at "
+                        f"{peak_label}."
+                    )
+                continue
+
+            if any(
+                value is None
+                for value in (row_fit, col_fit, A_fit, sigma_fit, r_squared)
+            ):
+                if verbose:
+                    print(
+                        f"[Frame {frame_idx}] Incomplete Gaussian fit for peak at "
+                        f"{peak_label}."
+                    )
+                continue
+
+            try:
+                pos_fit = (float(row_fit), float(col_fit))
+                A_fit = float(A_fit)
+                sigma_fit = float(sigma_fit)
+                r_squared = float(r_squared)
+            except (TypeError, ValueError):
+                if verbose:
+                    print(
+                        f"[Frame {frame_idx}] Non-numeric Gaussian fit for peak at "
+                        f"{peak_label}."
+                    )
+                continue
 
             if (
-                localized_peak is not None
-                and r_squared is not None
-                and r_squared >= r_squared_threshold
+                sigma_fit <= 0.0
+                or not np.all(
+                    np.isfinite(
+                        [pos_fit[0], pos_fit[1], A_fit, sigma_fit, r_squared]
+                    )
+                )
             ):
+                if verbose:
+                    print(
+                        f"[Frame {frame_idx}] Invalid Gaussian fit values for peak at "
+                        f"{peak_label}."
+                    )
+                continue
+
+            amp_fit = A_fit / (2 * np.pi * sigma_fit**2)
+
+            if not np.isfinite(amp_fit):
+                if verbose:
+                    print(
+                        f"[Frame {frame_idx}] Invalid amplitude for peak at "
+                        f"{peak_label}."
+                    )
+                continue
+
+            localized_peak = (pos_fit, amp_fit, sigma_fit, r_squared)
+
+            if r_squared >= r_squared_threshold:
                 localized_frame_peaks.append(localized_peak)
                 # print(
                 #     f"[Frame {frame_idx}] Fitted center for peak at "
@@ -320,16 +438,10 @@ def localize_peaks_with_gaussian_fitting(
                 #     f"amplitude {amp_fit:.2f}, sigma {sigma_fit:.2f}"
                 # )
 
-            elif r_squared is None:
-                print(
-                    f"[Frame {frame_idx}] No computed R-squared for peak at "
-                    f"({peak[0]}, {peak[1]})."
-                )
-
-            elif r_squared < r_squared_threshold:
+            elif verbose:
                 print(
                     f"[Frame {frame_idx}] Poor fit for peak at "
-                    f"({peak[0]}, {peak[1]}): R-squared = {r_squared:.3f} "
+                    f"{peak_label}: R-squared = {r_squared:.3f} "
                     f"(below threshold of {r_squared_threshold})."
                 )
 
@@ -855,8 +967,10 @@ def track(
     algo_traj2traj : {"hungarian", "local_nn", "global_nn"}, optional
         Assignment algorithm used to match localized trajectories to
         ground-truth trajectories.
-    cost_function : callable, optional
-        Custom peak-to-peak cost function. If None, the default cost is used.
+    cost_func_peak2peak : callable, optional
+        Custom peak-to-peak cost function. If None, the recommended default is used.
+    cost_func_traj2traj : callable, optional
+        Custom trajectory-to-trajectory cost function. If None, the recommended default is used.
     verbose_loc : bool, optional
         If True, print localization details.
     visualization_loc : bool, optional
@@ -909,6 +1023,12 @@ def track(
 
     else:
         raise ValueError("mode must be 'detection' or 'localization'.")
+
+    if cost_func_peak2peak is None:
+        cost_func_peak2peak = PeakToPeak.default()
+
+    if cost_func_traj2traj is None:
+        cost_func_traj2traj = TrajToTraj.default()
 
     trajectories_output, cost_peak2peak = track_peaks_to_trajectories(
         peaks=peaks_for_tracking,
@@ -1019,6 +1139,12 @@ def track_from_peaks(
     cost_func_traj2traj=None, 
     verbose_assignment=False):
     """Performs frame-to-frame tracking and trajectory assignment starting from pre-extracted peaks."""
+    if cost_func_peak2peak is None:
+        cost_func_peak2peak = PeakToPeak.default()
+
+    if cost_func_traj2traj is None:
+        cost_func_traj2traj = TrajToTraj.default()
+
     trajectories_output, cost_peak2peak = track_peaks_to_trajectories(
         peaks=peaks_for_tracking,
         max_distance=max_distance,
@@ -1358,4 +1484,181 @@ def NN_tracking_blinking(peaks, max_distance=5, min_length=2, max_missing_frames
 
     return trajectories
 
+# =============================================================================
+# Ligand-Receptor interactions
+# =============================================================================
+
+def count_peaks(peaks):
+    return int(sum(len(frame_peaks) for frame_peaks in peaks))
+
+
+def particle_type(traj):
+    return getattr(traj, "particle_type", "particle") or "particle"
+
+
+def gt_lookup(trajectories_GT):
+    return {
+        traj.id: traj
+        for traj in trajectories_GT
+        if traj.id is not None and traj.length() > 0
+    }
+
+
+def trajectory_frame_errors(traj, gt_traj):
+    rows = []
+    for frame in traj.frames():
+        pos = traj.get_position_at_frame(frame)
+        gt_pos = gt_traj.get_position_at_frame(frame)
+        if pos is None or gt_pos is None:
+            continue
+        rows.append((
+            frame,
+            float(np.linalg.norm(np.asarray(pos) - np.asarray(gt_pos))),
+        ))
+    return rows
+
+
+def evaluate_tracking_method(method_name, trajectories_est, trajectories_GT, tolerance=3.0):
+    gt_by_id = gt_lookup(trajectories_GT)
+    type_by_id = {gt_id: particle_type(traj) for gt_id, traj in gt_by_id.items()}
+    recovered_frames_by_gt = {gt_id: set() for gt_id in gt_by_id}
+    fragments_by_gt = {gt_id: 0 for gt_id in gt_by_id}
+    good_fragments_by_gt = {gt_id: 0 for gt_id in gt_by_id}
+    error_rows = []
+    track_rows = []
+
+    for track_idx, traj in enumerate(trajectories_est):
+        if traj.length() == 0:
+            continue
+
+        assigned_gt = traj.id if traj.id in gt_by_id else None
+        if assigned_gt is None:
+            track_rows.append({
+                "method": method_name,
+                "track_idx": track_idx,
+                "gt_id": np.nan,
+                "type": "unassigned",
+                "length": traj.length(),
+                "overlap_frames": 0,
+                "good_frames": 0,
+                "median_error_px": np.nan,
+            })
+            continue
+
+        gt_traj = gt_by_id[assigned_gt]
+        frame_errors = trajectory_frame_errors(traj, gt_traj)
+        errors = [err for _, err in frame_errors]
+        good_frames = [frame for frame, err in frame_errors if err <= tolerance]
+
+        if frame_errors:
+            fragments_by_gt[assigned_gt] += 1
+        if good_frames:
+            good_fragments_by_gt[assigned_gt] += 1
+            recovered_frames_by_gt[assigned_gt].update(good_frames)
+
+        for frame, error_px in frame_errors:
+            error_rows.append({
+                "method": method_name,
+                "gt_id": assigned_gt,
+                "type": type_by_id[assigned_gt],
+                "state": gt_traj.get_state_at_frame(frame),
+                "frame": frame,
+                "error_px": error_px,
+                "within_tolerance": error_px <= tolerance,
+            })
+
+        track_rows.append({
+            "method": method_name,
+            "track_idx": track_idx,
+            "gt_id": assigned_gt,
+            "type": type_by_id[assigned_gt],
+            "length": traj.length(),
+            "overlap_frames": len(frame_errors),
+            "good_frames": len(good_frames),
+            "median_error_px": float(np.median(errors)) if errors else np.nan,
+        })
+
+    per_gt_rows = []
+    state_rows = []
+    for gt_id, gt_traj in gt_by_id.items():
+        frames_gt = list(gt_traj.frames())
+        recovered = recovered_frames_by_gt[gt_id]
+        gt_type = particle_type(gt_traj)
+        coverage = len(recovered) / len(frames_gt) if frames_gt else np.nan
+
+        gt_errors = [row["error_px"] for row in error_rows if row["gt_id"] == gt_id]
+        per_gt_rows.append({
+            "method": method_name,
+            "gt_id": gt_id,
+            "type": gt_type,
+            "coverage": coverage,
+            "coverage_pct": 100 * coverage,
+            "recovered_ge50": coverage >= 0.5 if np.isfinite(coverage) else False,
+            "fragments": fragments_by_gt[gt_id],
+            "good_fragments": good_fragments_by_gt[gt_id],
+            "median_error_px": float(np.median(gt_errors)) if gt_errors else np.nan,
+        })
+
+        for state in ["free", "bound"]:
+            state_frames = [
+                frame for frame in frames_gt
+                if gt_traj.get_state_at_frame(frame) == state
+            ]
+            if not state_frames:
+                continue
+            state_recovered = len(set(state_frames) & recovered)
+            state_rows.append({
+                "method": method_name,
+                "gt_id": gt_id,
+                "type": gt_type,
+                "state": state,
+                "n_frames": len(state_frames),
+                "recovered_frames": state_recovered,
+                "coverage": state_recovered / len(state_frames),
+                "coverage_pct": 100 * state_recovered / len(state_frames),
+            })
+
+    per_gt = pd.DataFrame(per_gt_rows)
+    errors = pd.DataFrame(error_rows)
+    tracks = pd.DataFrame(track_rows)
+    states = pd.DataFrame(state_rows)
+
+    return {
+        "method": method_name,
+        "trajectories": trajectories_est,
+        "per_gt": per_gt,
+        "errors": errors,
+        "tracks": tracks,
+        "states": states,
+    }
+
+
+def summarize_metrics(metrics):
+    per_gt = metrics["per_gt"]
+    errors = metrics["errors"]
+    tracks = metrics["tracks"]
+    rows = []
+
+    for subset in ["all", "ligand", "receptor"]:
+        gt_subset = per_gt if subset == "all" else per_gt[per_gt["type"] == subset]
+        err_subset = errors if subset == "all" else errors[errors["type"] == subset]
+
+        rows.append({
+            "method": metrics["method"],
+            "population": subset,
+            "gt_count": len(gt_subset),
+            "tracks": int(len(tracks)) if subset == "all" else int((tracks["type"] == subset).sum()),
+            "unassigned_tracks": int((tracks["type"] == "unassigned").sum()) if subset == "all" else 0,
+            "mean_coverage_pct": gt_subset["coverage_pct"].mean(),
+            "recovered_gt_ge50": int(gt_subset["recovered_ge50"].sum()),
+            "mean_good_fragments": gt_subset["good_fragments"].mean(),
+            "median_error_px": err_subset["error_px"].median() if len(err_subset) else np.nan,
+            "within_tolerance_pct": 100 * err_subset["within_tolerance"].mean() if len(err_subset) else np.nan,
+        })
+
+    return pd.DataFrame(rows)
+
+
+def combined_summary_table(*metric_dicts):
+    return pd.concat([summarize_metrics(m) for m in metric_dicts], ignore_index=True)
 

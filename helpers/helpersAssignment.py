@@ -1,6 +1,33 @@
 import numpy as np
 from hungarian_algorithm import algorithm
 
+DEFAULT_COST_DISTANCE_NORM = 8.0
+DEFAULT_COST_INTENSITY_NORM = 700.0
+DEFAULT_COST_SIGMA_NORM = 0.75
+DEFAULT_COST_LENGTH_NORM = 10.0
+DEFAULT_COST_START_FRAME_NORM = 5.0
+
+
+def resolve_cost_norm(value, fallback):
+    if value is None:
+        return float(fallback)
+
+    try:
+        values = np.asarray(value, dtype=float)
+    except (TypeError, ValueError):
+        return float(fallback)
+
+    if values.shape == ():
+        norm = float(values)
+        return norm if np.isfinite(norm) and norm > 0 else float(fallback)
+
+    positive_values = values[np.isfinite(values) & (values > 0)]
+    if positive_values.size == 0:
+        return float(fallback)
+
+    return float(np.max(positive_values))
+
+
 # ------------------------ Assignment algorithms -------------------------
 def local_nn_assignment(cost_matrix, max_distance=10):
     """
@@ -56,6 +83,120 @@ def global_nn_assignment(cost_matrix, max_distance=10):
         if assignment[i] != -1:
             min_cost += cost_matrix[i][assignment[i]]
     return min_cost, assignment
+
+def greedy_one_to_one_assignment(cost_matrix, max_distance=10):
+    """Greedy one-to-one assignment that repeatedly selects the cheapest valid row-column pair.
+
+    This is a strict one-to-one baseline: each row and each column can be used at most once.
+    """
+    cost_matrix = np.asarray(cost_matrix, dtype=float)
+    if cost_matrix.ndim != 2:
+        raise ValueError("cost_matrix must be 2D")
+
+    n_rows, n_cols = cost_matrix.shape
+    assignment = np.full(n_rows, -1, dtype=int)
+
+    if n_rows == 0 or n_cols == 0:
+        return 0.0, assignment.tolist()
+
+    candidate_pairs = []
+    for i in range(n_rows):
+        for j in range(n_cols):
+            cost = float(cost_matrix[i, j])
+            if not np.isfinite(cost):
+                continue
+            if max_distance is not None and cost > max_distance:
+                continue
+            candidate_pairs.append((cost, i, j))
+
+    candidate_pairs.sort(key=lambda item: (item[0], item[1], item[2]))
+
+    used_rows = set()
+    used_cols = set()
+    min_cost = 0.0
+
+    for cost, i, j in candidate_pairs:
+        if i in used_rows or j in used_cols:
+            continue
+        assignment[i] = j
+        used_rows.add(i)
+        used_cols.add(j)
+        min_cost += cost
+
+    return float(min_cost), assignment.tolist()
+
+def mutual_nn_assignment(cost_matrix, max_distance=10):
+    """Mutual nearest-neighbor assignment with one-to-one matching.
+
+    At each round, rows and columns that are mutually closest are matched and removed.
+    This is stricter than local NN and cheaper than Hungarian, but it is still heuristic.
+    """
+    cost_matrix = np.asarray(cost_matrix, dtype=float)
+    if cost_matrix.ndim != 2:
+        raise ValueError("cost_matrix must be 2D")
+
+    n_rows, n_cols = cost_matrix.shape
+    assignment = np.full(n_rows, -1, dtype=int)
+
+    if n_rows == 0 or n_cols == 0:
+        return 0.0, assignment.tolist()
+
+    remaining_rows = list(range(n_rows))
+    remaining_cols = list(range(n_cols))
+    min_cost = 0.0
+
+    while remaining_rows and remaining_cols:
+        row_best = {}
+        col_best = {}
+
+        for i in remaining_rows:
+            row_values = cost_matrix[i, remaining_cols]
+            if row_values.size == 0:
+                continue
+            best_pos = int(np.argmin(row_values))
+            best_col = remaining_cols[best_pos]
+            best_cost = float(row_values[best_pos])
+            if np.isfinite(best_cost) and (max_distance is None or best_cost <= max_distance):
+                row_best[i] = (best_col, best_cost)
+
+        for j in remaining_cols:
+            col_values = cost_matrix[remaining_rows, j]
+            if col_values.size == 0:
+                continue
+            best_pos = int(np.argmin(col_values))
+            best_row = remaining_rows[best_pos]
+            best_cost = float(col_values[best_pos])
+            if np.isfinite(best_cost) and (max_distance is None or best_cost <= max_distance):
+                col_best[j] = (best_row, best_cost)
+
+        mutual_pairs = []
+        for i, (j, cost) in row_best.items():
+            best_row_for_col = col_best.get(j)
+            if best_row_for_col is not None and best_row_for_col[0] == i:
+                mutual_pairs.append((cost, i, j))
+
+        if not mutual_pairs:
+            break
+
+        mutual_pairs.sort(key=lambda item: (item[0], item[1], item[2]))
+        used_rows = set()
+        used_cols = set()
+
+        for cost, i, j in mutual_pairs:
+            if i in used_rows or j in used_cols:
+                continue
+            used_rows.add(i)
+            used_cols.add(j)
+            assignment[i] = j
+            min_cost += cost
+
+        if not used_rows:
+            break
+
+        remaining_rows = [i for i in remaining_rows if i not in used_rows]
+        remaining_cols = [j for j in remaining_cols if j not in used_cols]
+
+    return float(min_cost), assignment.tolist()
 
 def hungarian(cost):
     """Hungarian algorithm to find the minimum cost matching in a weighted bipartite graph.
@@ -222,7 +363,7 @@ def cost_cog(traj_new, traj_GT, invalid_cost=np.inf):
 # definition of the cost matrix
 def compute_cost_matrix_trajectories(trajectories_new, trajectories_GT, cost_function=None):
     if cost_function is None:
-        cost_function = mean_position_distance_on_overlap
+        cost_function = TrajToTraj.default()
 
     cost_matrix = np.zeros((len(trajectories_new), len(trajectories_GT)))
     for i, traj_new in enumerate(trajectories_new):
@@ -418,8 +559,8 @@ def assign_trajectories(
     Args:
          trajectories_new: list of trajectories to be assigned
          trajectories_GT: list of ground truth trajectories to assign to
-         algorithm: assignment algorithm to use ('hungarian', 'hungarian_pypi', 'local_nn', 'global_nn')
-         cost_function: cost function to compute the cost matrix; if None, defaults to mean_position_distance_on_overlap
+         algorithm: assignment algorithm to use ('hungarian', 'hungarian_pypi', 'local_nn', 'global_nn', 'greedy_nn', 'mutual_nn')
+         cost_function: cost function to compute the cost matrix; if None, uses the recommended TrajToTraj default
          verbose: if True, print detailed information about the cost matrix and assignment process
     Returns:
          trajectories_new: list of trajectories with updated IDs according to the assignment
@@ -451,8 +592,12 @@ def assign_trajectories(
         min_cost, assignment = local_nn_assignment(cost)
     elif algorithm == 'global_nn':
         min_cost, assignment = global_nn_assignment(cost)
+    elif algorithm == 'greedy_nn':
+        min_cost, assignment = greedy_one_to_one_assignment(cost)
+    elif algorithm == 'mutual_nn':
+        min_cost, assignment = mutual_nn_assignment(cost)
     else:
-        raise ValueError("Invalid algorithm specified. Choose 'hungarian', 'hungarian_pypi', 'local_nn', or 'global_nn'.")
+        raise ValueError("Invalid algorithm specified. Choose 'hungarian', 'hungarian_pypi', 'local_nn', 'global_nn', 'greedy_nn', or 'mutual_nn'.")
 
     if verbose:
         print_assignment(assignment)
@@ -623,12 +768,17 @@ class PeakToPeak(nn.Module):
         self.return_breakdown = return_breakdown
 
     @classmethod
-    def default(cls):
+    def default(cls, distance_norm=None, intensity_norm=None, sigma_norm=None):
+        """Recommended peak-to-peak cost from CostExperiment."""
+        distance_norm = resolve_cost_norm(distance_norm, DEFAULT_COST_DISTANCE_NORM)
+        intensity_norm = resolve_cost_norm(intensity_norm, DEFAULT_COST_INTENSITY_NORM)
+        sigma_norm = resolve_cost_norm(sigma_norm, DEFAULT_COST_SIGMA_NORM)
+
         return cls(
             terms={
-                "distance": DistanceTerm(weight=0.5, norm=0.1 * 128),
-                "intensity": IntensityTerm(weight=0.4, norm=1000),
-                "sigma": SigmaTerm(weight=0.1, norm=2.0),
+                "distance": DistanceTerm(weight=0.5, norm=distance_norm),
+                "intensity": IntensityTerm(weight=0.4, norm=intensity_norm),
+                "sigma": SigmaTerm(weight=0.1, norm=sigma_norm),
             }
         )
 
@@ -702,13 +852,21 @@ class TrajToTraj(nn.Module):
         self.return_breakdown = return_breakdown
 
     @classmethod
-    def default(cls):
+    def default(cls, position_norm=None, length_norm=None):
+        """Recommended trajectory-to-trajectory cost from CostExperiment."""
+        position_norm = resolve_cost_norm(position_norm, DEFAULT_COST_DISTANCE_NORM)
+        length_norm = resolve_cost_norm(length_norm, DEFAULT_COST_LENGTH_NORM)
+
         return cls(
             terms={
-                "mean_position_distance": MeanPositionDistanceTerm(
-                    weight=1.0,
-                    norm=1.0,
-                )
+                "position": MeanPositionDistanceTerm(
+                    weight=0.75,
+                    norm=position_norm,
+                ),
+                "length": LengthDifferenceTerm(
+                    weight=0.25,
+                    norm=length_norm,
+                ),
             }
         )
 

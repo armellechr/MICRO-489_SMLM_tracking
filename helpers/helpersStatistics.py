@@ -773,3 +773,464 @@ def plot_Ds_vs_D_GT(D_t, D_d, D_l, D):
     plt.grid()
     plt.show()
 
+
+def _finite_values(values):
+    values = np.asarray(values, dtype=float)
+    return values[np.isfinite(values)]
+
+
+def _safe_nanmean(values):
+    values = _finite_values(values)
+    return float(np.mean(values)) if len(values) else np.nan
+
+
+def _safe_nanmedian(values):
+    values = _finite_values(values)
+    return float(np.median(values)) if len(values) else np.nan
+
+
+def _boxplot_with_labels(ax, data, labels, **kwargs):
+    try:
+        return ax.boxplot(data, tick_labels=labels, **kwargs)
+    except TypeError:
+        return ax.boxplot(data, labels=labels, **kwargs)
+
+
+def _ensure_diffusion_params(trajectories, dt=1.0, tau=1):
+    for traj in trajectories:
+        if traj.length() <= tau:
+            traj.D1 = np.nan
+            traj.D2 = np.nan
+            traj.theta = np.nan
+            continue
+
+        if (
+            getattr(traj, "D1", None) is None
+            or getattr(traj, "D2", None) is None
+            or getattr(traj, "theta", None) is None
+        ):
+            try:
+                estimateDfromTrajectory(traj, dt=dt, tau=tau)
+            except Exception:
+                traj.D1 = np.nan
+                traj.D2 = np.nan
+                traj.theta = np.nan
+
+
+def _trajectory_position_errors(traj, gt_traj):
+    errors = []
+    frames = []
+
+    for frame in traj.frames():
+        pos = traj.get_position_at_frame(frame)
+        gt_pos = gt_traj.get_position_at_frame(frame)
+
+        if pos is None or gt_pos is None:
+            continue
+
+        errors.append(float(np.linalg.norm(np.asarray(pos) - np.asarray(gt_pos))))
+        frames.append(frame)
+
+    return errors, frames
+
+
+def _det_vs_loc_method_metrics(trajectories_est, trajectories_GT, dt=1.0, tau=1):
+    gt_by_id = {
+        traj.id: traj
+        for traj in trajectories_GT
+        if traj.id is not None and traj.length() > 0
+    }
+
+    _ensure_diffusion_params(trajectories_est, dt=dt, tau=tau)
+
+    all_errors = []
+    recovered_frames_by_gt = {gt_id: set() for gt_id in gt_by_id}
+    fragments_by_gt = {gt_id: 0 for gt_id in gt_by_id}
+    best_track_by_gt = {}
+    best_overlap_by_gt = {}
+    assigned_count = 0
+    unassigned_count = 0
+    track_lengths = []
+
+    for traj in trajectories_est:
+        if traj.length() == 0:
+            continue
+
+        track_lengths.append(traj.length())
+
+        if traj.id is None or traj.id == -1 or traj.id not in gt_by_id:
+            unassigned_count += 1
+            continue
+
+        assigned_count += 1
+        gt_traj = gt_by_id[traj.id]
+        errors, frames = _trajectory_position_errors(traj, gt_traj)
+
+        if len(frames) == 0:
+            continue
+
+        all_errors.extend(errors)
+        recovered_frames_by_gt[traj.id].update(frames)
+        fragments_by_gt[traj.id] += 1
+
+        overlap = len(frames)
+        if overlap > best_overlap_by_gt.get(traj.id, -1):
+            best_overlap_by_gt[traj.id] = overlap
+            best_track_by_gt[traj.id] = traj
+
+    coverage = []
+    fragment_counts = []
+    gt_ids = sorted(gt_by_id)
+
+    for gt_id in gt_ids:
+        gt_len = gt_by_id[gt_id].length()
+        coverage.append(
+            len(recovered_frames_by_gt[gt_id]) / gt_len
+            if gt_len > 0 else np.nan
+        )
+        fragment_counts.append(fragments_by_gt[gt_id])
+
+    return {
+        "gt_ids": gt_ids,
+        "errors": np.asarray(all_errors, dtype=float),
+        "coverage": np.asarray(coverage, dtype=float),
+        "fragments": np.asarray(fragment_counts, dtype=float),
+        "track_lengths": np.asarray(track_lengths, dtype=float),
+        "best_track_by_gt": best_track_by_gt,
+        "assigned_count": assigned_count,
+        "unassigned_count": unassigned_count,
+        "n_tracks": len([traj for traj in trajectories_est if traj.length() > 0]),
+    }
+
+
+def _scalar_D_by_gt(trajectories_GT, best_track_by_gt, dt=1.0, tau=1):
+    _ensure_diffusion_params(trajectories_GT, dt=dt, tau=tau)
+
+    gt_ids = sorted(
+        traj.id for traj in trajectories_GT
+        if traj.id is not None and traj.length() > 0
+    )
+
+    gt_by_id = {traj.id: traj for traj in trajectories_GT if traj.id in gt_ids}
+    D_gt = []
+    D_est = []
+
+    for gt_id in gt_ids:
+        gt_traj = gt_by_id[gt_id]
+        D_gt.append(tensor_to_scalar_D(gt_traj.D1, gt_traj.D2))
+
+        est_traj = best_track_by_gt.get(gt_id)
+        if est_traj is None:
+            D_est.append(np.nan)
+        else:
+            D_est.append(tensor_to_scalar_D(est_traj.D1, est_traj.D2))
+
+    return gt_ids, np.asarray(D_gt, dtype=float), np.asarray(D_est, dtype=float)
+
+
+def _flatten_peak_attr(peaks, attr_idx):
+    if peaks is None:
+        return np.asarray([], dtype=float)
+
+    values = []
+    for frame_peaks in peaks:
+        for peak in frame_peaks:
+            if len(peak) <= attr_idx:
+                continue
+            value = peak[attr_idx]
+            if value is not None:
+                values.append(value)
+
+    return _finite_values(values)
+
+
+def _peak_count(peaks):
+    if peaks is None:
+        return None
+    return np.asarray([len(frame_peaks) for frame_peaks in peaks], dtype=float)
+
+
+def _axis_no_data(ax, message):
+    ax.text(
+        0.5,
+        0.5,
+        message,
+        ha="center",
+        va="center",
+        transform=ax.transAxes,
+        color="#6b7280",
+    )
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+
+def plot_det_vs_loc_core_figure(
+    trajectories_GT,
+    trajectories_detection,
+    trajectories_localization,
+    peaks_detection=None,
+    peaks_localization=None,
+    dt=1.0,
+    tau=1,
+    figsize=(16, 10),
+    title="Detection vs localization core metrics",
+    return_summary=False,
+    panel_labels=True,
+):
+    """
+    Plot a compact 2x3 comparison of integer-peak detection and Gaussian localization.
+
+    The trajectory lists are expected to have already been assigned to GT ids,
+    as returned by ``track(..., mode="detection")`` and
+    ``track(..., mode="localization")``. Optional peak lists can be passed from
+    ``extract_peaks`` to show Gaussian R2 and kept/rejected peak diagnostics.
+    """
+    det_color = "#2f80ed"
+    loc_color = "#d1495b"
+
+    det = _det_vs_loc_method_metrics(
+        trajectories_detection,
+        trajectories_GT,
+        dt=dt,
+        tau=tau,
+    )
+    loc = _det_vs_loc_method_metrics(
+        trajectories_localization,
+        trajectories_GT,
+        dt=dt,
+        tau=tau,
+    )
+
+    gt_ids, D_gt, D_det = _scalar_D_by_gt(
+        trajectories_GT,
+        det["best_track_by_gt"],
+        dt=dt,
+        tau=tau,
+    )
+    _, _, D_loc = _scalar_D_by_gt(
+        trajectories_GT,
+        loc["best_track_by_gt"],
+        dt=dt,
+        tau=tau,
+    )
+
+    det_D_error = np.abs(D_det - D_gt)
+    loc_D_error = np.abs(D_loc - D_gt)
+    D_improvement = det_D_error - loc_D_error
+
+    fig, axes = plt.subplots(2, 3, figsize=figsize)
+    axes = axes.ravel()
+    fig.suptitle(title, fontsize=14)
+
+    if panel_labels:
+        for label, ax in zip("ABCDEF", axes):
+            ax.text(
+                -0.12,
+                1.08,
+                label,
+                transform=ax.transAxes,
+                fontsize=14,
+                fontweight="bold",
+                va="top",
+                ha="left",
+            )
+
+    # 1. Position error distribution
+    ax = axes[0]
+    error_data = []
+    error_labels = []
+    if len(det["errors"]):
+        error_data.append(det["errors"])
+        error_labels.append("Detection")
+    if len(loc["errors"]):
+        error_data.append(loc["errors"])
+        error_labels.append("Localization")
+
+    if error_data:
+        bp = _boxplot_with_labels(
+            ax,
+            error_data,
+            error_labels,
+            showfliers=False,
+            patch_artist=True,
+            medianprops={"color": "#111827"},
+        )
+        colors = [det_color if label == "Detection" else loc_color for label in error_labels]
+        for box, color in zip(bp["boxes"], colors):
+            box.set_facecolor(color)
+            box.set_alpha(0.25)
+            box.set_edgecolor(color)
+        ax.set_ylabel("Position error (px)")
+        ax.set_title("Assigned-point localization error")
+    else:
+        _axis_no_data(ax, "No assigned point overlap")
+        ax.set_title("Assigned-point localization error")
+    ax.grid(axis="y", alpha=0.3)
+
+    # 2. Gaussian diagnostics
+    ax = axes[1]
+    r2_values = _flatten_peak_attr(peaks_localization, 3)
+    sigma_values = _flatten_peak_attr(peaks_localization, 2)
+    if len(sigma_values) == 0:
+        sigma_values = _finite_values(
+            [
+                sigma
+                for traj in trajectories_localization
+                for sigma in getattr(traj, "sigmas", [])
+                if sigma is not None
+            ]
+        )
+
+    det_peak_count = _peak_count(peaks_detection)
+    loc_peak_count = _peak_count(peaks_localization)
+
+    if len(r2_values):
+        ax.hist(r2_values, bins=20, color=loc_color, alpha=0.75)
+        ax.set_xlabel("Gaussian fit R2")
+        ax.set_ylabel("Kept peaks")
+        if det_peak_count is not None and loc_peak_count is not None:
+            total = int(np.sum(det_peak_count))
+            kept = int(np.sum(loc_peak_count))
+            kept_fraction = kept / total if total > 0 else np.nan
+            ax.set_title(f"Gaussian fit quality, kept {kept}/{total} ({kept_fraction:.0%})")
+        else:
+            ax.set_title("Gaussian fit quality")
+    elif len(sigma_values):
+        ax.hist(sigma_values, bins=20, color=loc_color, alpha=0.75)
+        ax.set_xlabel("Fitted sigma (px)")
+        ax.set_ylabel("Count")
+        ax.set_title("Gaussian sigma diagnostics")
+    else:
+        _axis_no_data(ax, "Pass peaks_localization for R2 diagnostics")
+        ax.set_title("Gaussian diagnostics")
+    ax.grid(axis="y", alpha=0.3)
+
+    # 3. Coverage per GT trajectory
+    ax = axes[2]
+    width = 0.38
+    x = np.arange(len(det["gt_ids"]))
+    if len(x):
+        ax.bar(x - width / 2, det["coverage"], width, label="Detection", color=det_color)
+        ax.bar(x + width / 2, loc["coverage"], width, label="Localization", color=loc_color)
+        ax.set_xticks(x)
+        ax.set_xticklabels(det["gt_ids"], rotation=45)
+        ax.set_ylim(0, 1.05)
+        ax.set_xlabel("GT trajectory id")
+        ax.set_ylabel("Recovered-frame fraction")
+        ax.legend()
+    else:
+        _axis_no_data(ax, "No GT trajectories")
+    ax.set_title("Trajectory coverage")
+    ax.grid(axis="y", alpha=0.3)
+
+    # 4. Track length and fragmentation
+    ax = axes[3]
+    length_data = []
+    length_labels = []
+    if len(det["track_lengths"]):
+        length_data.append(det["track_lengths"])
+        length_labels.append("Detection")
+    if len(loc["track_lengths"]):
+        length_data.append(loc["track_lengths"])
+        length_labels.append("Localization")
+
+    if length_data:
+        bp = _boxplot_with_labels(
+            ax,
+            length_data,
+            length_labels,
+            showfliers=False,
+            patch_artist=True,
+        )
+        colors = [det_color if label == "Detection" else loc_color for label in length_labels]
+        for box, color in zip(bp["boxes"], colors):
+            box.set_facecolor(color)
+            box.set_alpha(0.25)
+            box.set_edgecolor(color)
+        ax.set_ylabel("Track length (frames)")
+        ax.set_title(
+            "Retained track length "
+            f"(n={det['n_tracks']} / {loc['n_tracks']})"
+        )
+    else:
+        _axis_no_data(ax, "No retained tracks")
+        ax.set_title("Retained track length")
+    ax.grid(axis="y", alpha=0.3)
+
+    # 5. Estimated scalar diffusion versus GT
+    ax = axes[4]
+    valid_det = np.isfinite(D_gt) & np.isfinite(D_det)
+    valid_loc = np.isfinite(D_gt) & np.isfinite(D_loc)
+
+    if np.any(valid_det):
+        ax.scatter(D_gt[valid_det], D_det[valid_det], color=det_color, label="Detection")
+    if np.any(valid_loc):
+        ax.scatter(D_gt[valid_loc], D_loc[valid_loc], color=loc_color, label="Localization")
+
+    valid_all = np.isfinite(D_gt) & (np.isfinite(D_det) | np.isfinite(D_loc))
+    if np.any(valid_all):
+        lo = float(np.nanmin([np.nanmin(D_gt[valid_all]), np.nanmin(D_det[valid_det]) if np.any(valid_det) else np.nan, np.nanmin(D_loc[valid_loc]) if np.any(valid_loc) else np.nan]))
+        hi = float(np.nanmax([np.nanmax(D_gt[valid_all]), np.nanmax(D_det[valid_det]) if np.any(valid_det) else np.nan, np.nanmax(D_loc[valid_loc]) if np.any(valid_loc) else np.nan]))
+        pad = 0.05 * (hi - lo) if hi > lo else 0.1
+        ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], "--", color="#111827", linewidth=1, label="GT")
+        ax.set_xlim(lo - pad, hi + pad)
+        ax.set_ylim(lo - pad, hi + pad)
+        ax.legend()
+    else:
+        _axis_no_data(ax, "No valid D estimates")
+
+    ax.set_xlabel("GT D_iso")
+    ax.set_ylabel("Estimated D_iso")
+    ax.set_title("Estimated diffusion vs GT")
+    ax.grid(alpha=0.3)
+
+    # 6. Paired D error improvement
+    ax = axes[5]
+    valid_improvement = np.isfinite(D_improvement)
+    if np.any(valid_improvement):
+        x_imp = np.arange(len(gt_ids))[valid_improvement]
+        colors = [
+            loc_color if value > 0 else det_color
+            for value in D_improvement[valid_improvement]
+        ]
+        ax.axhline(0, color="#111827", linewidth=1)
+        ax.bar(x_imp, D_improvement[valid_improvement], color=colors, alpha=0.8)
+        ax.set_xticks(np.arange(len(gt_ids)))
+        ax.set_xticklabels(gt_ids, rotation=45)
+        ax.set_xlabel("GT trajectory id")
+        ax.set_ylabel("|D_det - D_GT| - |D_loc - D_GT|")
+        ax.set_title("Error improvement (positive where localization improved D)")
+    else:
+        _axis_no_data(ax, "No paired D estimates")
+        ax.set_title("Paired D error improvement")
+    ax.grid(axis="y", alpha=0.3)
+
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    plt.show()
+
+    summary = {
+        "detection": {
+            "n_tracks": det["n_tracks"],
+            "n_assigned": det["assigned_count"],
+            "n_unassigned": det["unassigned_count"],
+            "median_position_error_px": _safe_nanmedian(det["errors"]),
+            "mean_coverage": _safe_nanmean(det["coverage"]),
+            "median_track_length": _safe_nanmedian(det["track_lengths"]),
+            "MAE_D_iso": _safe_nanmean(det_D_error),
+        },
+        "localization": {
+            "n_tracks": loc["n_tracks"],
+            "n_assigned": loc["assigned_count"],
+            "n_unassigned": loc["unassigned_count"],
+            "median_position_error_px": _safe_nanmedian(loc["errors"]),
+            "mean_coverage": _safe_nanmean(loc["coverage"]),
+            "median_track_length": _safe_nanmedian(loc["track_lengths"]),
+            "MAE_D_iso": _safe_nanmean(loc_D_error),
+        },
+    }
+
+    if return_summary:
+        return summary
+
+    return None
+

@@ -1,0 +1,7 @@
+[NbConvertApp] Converting notebook MICRO-489_SMLM_tracking\Experiments\CostExperiment.ipynb to notebook
+C:\Users\armel\anaconda3\lib\site-packages\zmq\_future.py:718: RuntimeWarning: Proactor event loop does not implement add_reader family of methods required for zmq. Registering an additional selector thread for add_reader support via tornado. Use `asyncio.set_event_loop_policy(WindowsSelectorEventLoopPolicy())` to avoid this warning.
+  self._get_loop()
+[IPKernelApp] WARNING | Could not set permissions on C:\Users\armel\.ipython\profile_default\security
+[IPKernelApp] WARNING | Could not set permissions on C:\Users\armel\.ipython\profile_default\pid
+[IPKernelApp] WARNING | Could not set permissions on C:\Users\armel\.ipython\profile_default\security
+[IPKernelApp] WARNING | Could not set permissions on C:\Users\armel\.ipython\profile_default\pid

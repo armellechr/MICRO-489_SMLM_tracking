@@ -3,6 +3,7 @@
 # =============================================================================
 
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import math
 import copy
@@ -364,7 +365,7 @@ def localize_peaks_with_gaussian_fitting(
                 if verbose:
                     print(
                         f"[Frame {frame_idx}] No computed R-squared for peak at "
-                        f"{peak_label}."
+                        f"{peak_label}." # either RuntimeError, ValueError, or FloatingPointError during fitting or if the patch was incomplete (not 5x5)
                     )
                 continue
 
@@ -838,6 +839,267 @@ def stitch_trajectory_fragments(
 
     return stitched
 
+
+def _copy_trajectory_with_id(trajectory, new_id):
+    copied = copy.deepcopy(trajectory)
+    copied.id = new_id
+    return copied
+
+
+def _copy_positions_into_trajectory(target, source):
+    for frame, position, intensity, sigma, state, bound_to in zip(
+        source.frames(),
+        source.positions,
+        source.intensities,
+        source.sigmas,
+        source.states,
+        source.bound_to,
+    ):
+        if frame <= target.end_frame:
+            continue
+
+        target.add_position(
+            position,
+            frame=frame,
+            intensity=intensity,
+            sigma=sigma,
+            state=state,
+            bound_to=bound_to,
+        )
+
+
+def _fill_gap_from_static_anchor(target, head, static_anchor):
+    filled_frames = []
+
+    for frame in range(target.end_frame + 1, head.start_frame):
+        anchor_position = static_anchor.get_position_at_frame(frame)
+        if anchor_position is None:
+            continue
+
+        target.add_position(
+            anchor_position,
+            frame=frame,
+            intensity=static_anchor.get_intensity_at_frame(frame),
+            sigma=static_anchor.get_sigma_at_frame(frame),
+            state="bridged_bound",
+            bound_to=static_anchor.id,
+        )
+        filled_frames.append(frame)
+
+    return filled_frames
+
+
+def bridge_mobile_fragments_through_static_anchors(
+    mobile_trajectories,
+    static_trajectories,
+    max_gap=12,
+    anchor_radius=10.0,
+    max_link_cost=2.5,
+    gap_weight=0.05,
+    fill_bound_frames=True,
+    max_iterations=5,
+    return_diagnostics=False,
+    verbose=False,
+):
+    """
+    Link mobile trajectory fragments that disappear and reappear near the same
+    static anchor.
+
+    This is intended for ligand-receptor simulations where receptor peaks are
+    removed before mobile tracking. A bound ligand can become hidden by the
+    receptor peak; this helper reconnects the ligand fragments through the
+    receptor trajectory and can fill the hidden bound frames with inferred
+    anchor positions.
+    """
+    bridged = [
+        copy.deepcopy(traj)
+        for traj in mobile_trajectories
+        if traj.length() > 0
+    ]
+    anchors = [
+        traj for traj in static_trajectories
+        if traj.length() > 0
+    ]
+
+    diagnostics = {
+        "links": [],
+        "filled_frames": 0,
+        "iterations": 0,
+    }
+
+    if len(bridged) <= 1 or len(anchors) == 0:
+        if return_diagnostics:
+            return bridged, diagnostics
+        return bridged
+
+    invalid_cost = 1e6
+
+    for iteration in range(max_iterations):
+        n = len(bridged)
+        cost_matrix = np.full((n, n), invalid_cost, dtype=float)
+        best_anchor = {}
+
+        for i, tail in enumerate(bridged):
+            tail_pos = np.asarray(tail.last_position(), dtype=float)
+            tail_frame = tail.end_frame
+
+            for j, head in enumerate(bridged):
+                if i == j:
+                    continue
+
+                elapsed_frames = head.start_frame - tail_frame
+                missing_frames = elapsed_frames - 1
+
+                if elapsed_frames <= 0 or missing_frames > max_gap:
+                    continue
+
+                head_pos = np.asarray(head.positions[0], dtype=float)
+                head_frame = head.start_frame
+                best_pair_cost = invalid_cost
+                best_pair_anchor = None
+                best_pair_distances = None
+
+                for anchor in anchors:
+                    tail_anchor_pos = anchor.get_position_at_frame(tail_frame)
+                    head_anchor_pos = anchor.get_position_at_frame(head_frame)
+
+                    if tail_anchor_pos is None or head_anchor_pos is None:
+                        continue
+
+                    tail_anchor_pos = np.asarray(tail_anchor_pos, dtype=float)
+                    head_anchor_pos = np.asarray(head_anchor_pos, dtype=float)
+                    tail_distance = np.linalg.norm(tail_pos - tail_anchor_pos)
+                    head_distance = np.linalg.norm(head_pos - head_anchor_pos)
+
+                    if (
+                        tail_distance > anchor_radius
+                        or head_distance > anchor_radius
+                    ):
+                        continue
+
+                    cost = (
+                        tail_distance / anchor_radius
+                        + head_distance / anchor_radius
+                        + gap_weight * missing_frames
+                    )
+
+                    if cost < best_pair_cost:
+                        best_pair_cost = cost
+                        best_pair_anchor = anchor
+                        best_pair_distances = (tail_distance, head_distance)
+
+                if best_pair_anchor is None or best_pair_cost > max_link_cost:
+                    continue
+
+                cost_matrix[i, j] = best_pair_cost
+                best_anchor[(i, j)] = (
+                    best_pair_anchor,
+                    best_pair_distances,
+                    missing_frames,
+                )
+
+        if not np.any(cost_matrix < invalid_cost):
+            break
+
+        _, assignment = hungarian(cost_matrix)
+        successor = {}
+        predecessor = set()
+        iteration_links = []
+
+        for i, j in enumerate(assignment):
+            if j == -1 or cost_matrix[i, j] >= invalid_cost:
+                continue
+
+            anchor, distances, missing_frames = best_anchor[(i, int(j))]
+            successor[i] = int(j)
+            predecessor.add(int(j))
+            iteration_links.append({
+                "tail_index": i,
+                "head_index": int(j),
+                "anchor_id": anchor.id,
+                "cost": float(cost_matrix[i, j]),
+                "missing_frames": int(missing_frames),
+                "tail_anchor_distance": float(distances[0]),
+                "head_anchor_distance": float(distances[1]),
+            })
+
+        if len(successor) == 0:
+            break
+
+        merged = []
+        visited = set()
+        starts = [idx for idx in range(n) if idx not in predecessor]
+
+        for start in starts:
+            if start in visited:
+                continue
+
+            current_idx = start
+            chain_indices = []
+
+            while current_idx not in visited:
+                visited.add(current_idx)
+                chain_indices.append(current_idx)
+
+                if current_idx not in successor:
+                    break
+
+                current_idx = successor[current_idx]
+
+            merged_traj = _copy_trajectory_with_id(
+                bridged[chain_indices[0]],
+                new_id=len(merged),
+            )
+
+            for tail_idx, head_idx in zip(chain_indices[:-1], chain_indices[1:]):
+                anchor = best_anchor[(tail_idx, head_idx)][0]
+
+                if fill_bound_frames:
+                    filled_frames = _fill_gap_from_static_anchor(
+                        merged_traj,
+                        bridged[head_idx],
+                        anchor,
+                    )
+                    diagnostics["filled_frames"] += len(filled_frames)
+
+                _copy_positions_into_trajectory(merged_traj, bridged[head_idx])
+
+            bridge_links = merged_traj.metadata.get("bridge_links", [])
+            bridge_links.extend(
+                link for link in iteration_links
+                if link["tail_index"] in chain_indices[:-1]
+            )
+            merged_traj.metadata["bridge_links"] = bridge_links
+            merged.append(merged_traj)
+
+        for idx in range(n):
+            if idx in visited:
+                continue
+            merged.append(_copy_trajectory_with_id(bridged[idx], len(merged)))
+
+        diagnostics["links"].extend(iteration_links)
+        diagnostics["iterations"] = iteration + 1
+
+        if verbose:
+            print(
+                f"Bridge iteration {iteration + 1}: "
+                f"{n} -> {len(merged)} trajectories "
+                f"({len(iteration_links)} links)"
+            )
+
+        if len(merged) == n:
+            break
+
+        bridged = merged
+
+    for idx, traj in enumerate(bridged):
+        traj.id = idx
+
+    if return_diagnostics:
+        return bridged, diagnostics
+
+    return bridged
+
 # =============================================================================
 # Full tracking pipeline with detection or detection+localization
 # =============================================================================
@@ -845,6 +1107,7 @@ def stitch_trajectory_fragments(
 def remove_static_peaks(peaks_for_tracking,
                         static_trajectories,
                         tolerance=5.0,
+                        return_removed=False,
                         verbose=False):
     """
     Remove peaks that correspond to static trajectories by matching each
@@ -862,16 +1125,20 @@ def remove_static_peaks(peaks_for_tracking,
             - positions (list of (x, y))
     tolerance : float
         Maximum allowed distance to consider a peak as belonging to a static trajectory.
+    return_removed : bool
+        If True, also return metadata for removed peaks.
     verbose : bool
         If True, prints detailed removal logs.
 
     Returns
     -------
-    cleaned_peaks : list[list]
-        Deep copy of peaks_for_tracking with static peaks removed.
+    cleaned_peaks : list[list] or tuple
+        Deep copy of peaks_for_tracking with static peaks removed. If
+        ``return_removed`` is True, returns ``(cleaned_peaks, removed_peaks)``.
     """
 
     cleaned_peaks = copy.deepcopy(peaks_for_tracking)
+    removed_peaks = []
 
     for traj in static_trajectories:
         removed_count = 0
@@ -898,6 +1165,13 @@ def remove_static_peaks(peaks_for_tracking,
             if closest_dist < tolerance:
                 removed_peak = peak_list.pop(closest_idx)
                 removed_count += 1
+                removed_peaks.append({
+                    "frame": frame_id,
+                    "static_id": traj.id,
+                    "static_position": tuple(traj_pos),
+                    "peak": removed_peak,
+                    "distance": float(closest_dist),
+                })
 
                 # if verbose:
                 #     print(
@@ -915,11 +1189,14 @@ def remove_static_peaks(peaks_for_tracking,
                 f"(length {length}, frames {start}–{end})"
             )
 
+    if return_removed:
+        return cleaned_peaks, removed_peaks
+
     return cleaned_peaks
 
 def track(
     frames,
-    trajectories_GT,
+    trajectories_GT=None,
     mode="localization",
     detection_threshold=None,
     max_distance=10,
@@ -930,7 +1207,7 @@ def track(
     stitch_base_distance=10.0,
     stitch_kwargs=None,
     verbose_stitching=False,
-    r_squared_threshold=0.5,
+    r_squared_threshold=0.45,
     algo_peak2peak="hungarian",
     cost_func_peak2peak=None,
     algo_traj2traj="hungarian",
@@ -989,6 +1266,7 @@ def track(
         min = np.min(frames)
         k = 0.7
         detection_threshold = max - k*(max - min)
+        print(f"Auto-computed detection threshold: {detection_threshold:.2f} (k={k})")
 
     detected_peaks = detect_peaks(
     frames,
@@ -1052,24 +1330,28 @@ def track(
     if len(trajectories_output) == 0:
         return [], cost_peak2peak, [], np.inf
 
-    (
-        trajectories_output,
-        cost_traj2traj,
-        assignment_output,
-    ) = assign_trajectories(
-        trajectories_output,
-        trajectories_GT,
-        algorithm=algo_traj2traj,
-        cost_function=cost_func_traj2traj,
-        verbose=verbose_assignment,
-    )
+    # case of real data
+    if trajectories_GT is None:
+        return trajectories_output, cost_peak2peak, [], np.inf
+    else:
+        (
+            trajectories_output,
+            cost_traj2traj,
+            assignment_output,
+        ) = assign_trajectories(
+            trajectories_output,
+            trajectories_GT,
+            algorithm=algo_traj2traj,
+            cost_function=cost_func_traj2traj,
+            verbose=verbose_assignment,
+        )
 
-    return (
-        trajectories_output,
-        cost_peak2peak,
-        assignment_output,
-        cost_traj2traj,
-    )
+        return (
+            trajectories_output,
+            cost_peak2peak,
+            assignment_output,
+            cost_traj2traj,
+        )
 
 def extract_peaks(
     frames, 
@@ -1124,7 +1406,7 @@ def extract_peaks(
 
 def track_from_peaks(
     peaks_for_tracking, 
-    trajectories_GT, 
+    trajectories_GT=None, 
     max_distance=10, 
     min_length=5, 
     max_gap=0,
@@ -1145,6 +1427,7 @@ def track_from_peaks(
     if cost_func_traj2traj is None:
         cost_func_traj2traj = TrajToTraj.default()
 
+    print(f'Tracking {sum(len(frame_peaks) for frame_peaks in peaks_for_tracking)} peaks across {len(peaks_for_tracking)} frames...')
     trajectories_output, cost_peak2peak = track_peaks_to_trajectories(
         peaks=peaks_for_tracking,
         max_distance=max_distance,
@@ -1167,24 +1450,29 @@ def track_from_peaks(
     if len(trajectories_output) == 0:
         return [], cost_peak2peak, [], np.inf
 
-    (
-        trajectories_output,
-        cost_traj2traj,
-        assignment_output,
-    ) = assign_trajectories(
-        trajectories_output,
-        trajectories_GT,
-        algorithm=algo_traj2traj,
-        cost_function=cost_func_traj2traj,
-        verbose=verbose_assignment,
-    )
+     # case of real data
+    if trajectories_GT is None:
+        print(f'Found {len(trajectories_output)} mobile trajectories')
+        return trajectories_output, cost_peak2peak, [], np.inf
+    else:
+        (
+            trajectories_output,
+            cost_traj2traj,
+            assignment_output,
+        ) = assign_trajectories(
+            trajectories_output,
+            trajectories_GT,
+            algorithm=algo_traj2traj,
+            cost_function=cost_func_traj2traj,
+            verbose=verbose_assignment,
+        )
 
-    return (
-        trajectories_output,
-        cost_peak2peak,
-        assignment_output,
-        cost_traj2traj,
-    )
+        return (
+            trajectories_output,
+            cost_peak2peak,
+            assignment_output,
+            cost_traj2traj,
+        )
 
 # =============================================================================
 # Trajectory utilities

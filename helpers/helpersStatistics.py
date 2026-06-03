@@ -5,7 +5,9 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import math
-from scipy.optimize import curve_fit
+import pandas as pd
+from collections import Counter
+from scipy.optimize import linear_sum_assignment
 
 # =============================================================================
 # Scalar MSD (isotropic only))
@@ -285,9 +287,9 @@ def print_traj_params_aligned(trajectories_list):
 
     print(f"Parameters (aligned by trajectory ID):")
     for traj, params in aligned_params.items():
-        D1_values = ", ".join(f"{d:.3f}" if np.isfinite(d) else "nan" for d in params["D1"])
-        D2_values = ", ".join(f"{d:.3f}" if np.isfinite(d) else "nan" for d in params["D2"])
-        theta_values = ", ".join(f"{d:.3f}" if np.isfinite(d) else "nan" for d in params["theta"])
+        D1_values = ", ".join(f"{d:.3f}" for d in params["D1"])
+        D2_values = ", ".join(f"{d:.3f}" for d in params["D2"])
+        theta_values = ", ".join(f"{d:.3f}" for d in params["theta"])
         print(f"Trajectory ID {traj.id}: D1=[{D1_values}], D2=[{D2_values}], theta=[{theta_values}]")
 
 # =============================================================================
@@ -491,45 +493,30 @@ def evaluate_diffusion(
 ):
     """
     Estimate diffusion tensors and compute errors against ground truth.
-
-    Works for both isotropic and anisotropic diffusion. Isotropic diffusion is
-    treated as the special case where D1 ≈ D2.
-
-    Parameters
-    ----------
-    trajectories_est : list of Trajectory
-        Estimated trajectories assigned to GT ids.
-    trajectories_GT : list of Trajectory
-        Ground-truth trajectories.
-    target : {"trajectory", "detection", "localization"}
-        Attribute namespace where estimated values are stored.
-    dt : float
-        Time between stored trajectory points.
-    tau : int
-        Lag used for tensor estimation.
-    angle : bool
-        If True, also compute angular error.
-
-    Returns
-    -------
-    dict
-        Dictionary containing GT parameters, estimated parameters, and errors.
+    Compares only GT trajectories that have a corresponding estimated trajectory.
     """
-    n_GT = len(trajectories_GT)
 
-    # estimate_diffusion_tensors(
-    #     trajectories_est,
-    #     dt=dt,
-    #     tau=tau,
-    #     target=target,
-    # )
+    gt_by_id = {traj.id: traj for traj in trajectories_GT}
+    est_by_id = {traj.id: traj for traj in trajectories_est}
 
-    D1_GT, D2_GT, theta_GT = get_traj_params(trajectories_GT, target='GT')
+    common_ids = sorted(set(gt_by_id.keys()) & set(est_by_id.keys()))
+
+    if len(common_ids) == 0:
+        raise ValueError("No matching trajectory IDs between estimated and GT trajectories.")
+
+    trajectories_GT_common = [gt_by_id[i] for i in common_ids]
+    trajectories_est_common = [est_by_id[i] for i in common_ids]
+
+    n_common = len(common_ids)
+
+    D1_GT, D2_GT, theta_GT = get_traj_params(
+        trajectories_GT_common,
+        nparticles=n_common
+    )
 
     D1_est, D2_est, theta_est = get_traj_params(
-        trajectories_est,
-        nparticles=n_GT,
-        target=target
+        trajectories_est_common,
+        nparticles=n_common
     )
 
     D_iso_GT = tensor_to_scalar_D(D1_GT, D2_GT)
@@ -538,7 +525,7 @@ def evaluate_diffusion(
     errors = {
         "D1": np.abs(np.array(D1_est) - np.array(D1_GT)),
         "D2": np.abs(np.array(D2_est) - np.array(D2_GT)),
-        "D_iso": np.abs(np.array(D_iso_est) - np.array(D_iso_GT))
+        "D_iso": np.abs(np.array(D_iso_est) - np.array(D_iso_GT)),
     }
 
     if angle:
@@ -546,6 +533,10 @@ def evaluate_diffusion(
 
     return {
         "target": target,
+        "matched_ids": common_ids,
+        "n_matched": n_common,
+        "n_est": len(trajectories_est),
+        "n_GT": len(trajectories_GT),
         "D1_GT": D1_GT,
         "D2_GT": D2_GT,
         "theta_GT": theta_GT,
@@ -1233,4 +1224,212 @@ def plot_det_vs_loc_core_figure(
         return summary
 
     return None
+
+# =============================================================================
+# HOTA helpers
+# =============================================================================
+
+def finite_mean(values):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    return float(np.mean(values)) if len(values) else np.nan
+
+def finite_median(values):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    return float(np.median(values)) if len(values) else np.nan
+
+def finite_sem(values):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if len(values) <= 1:
+        return np.nan
+    return float(np.std(values, ddof=1) / np.sqrt(len(values)))
+
+def valid_gt_id(gid, gt_by_id):
+    return gid is not None and gid != -1 and gid in gt_by_id
+
+def edge_counter(trajectories, require_valid_gt=True, gt_by_id=None):
+    edges = Counter()
+    for traj in trajectories:
+        gid = traj.id
+        if require_valid_gt and not valid_gt_id(gid, gt_by_id):
+            continue
+        frames = sorted(traj.frames())
+        for f0, f1 in zip(frames[:-1], frames[1:]):
+            if f1 == f0 + 1:
+                edges[(int(gid), int(f0), int(f1))] += 1
+    return edges
+
+def precision_recall_f1(pred_edges, gt_edges):
+    tp = sum(min(count, gt_edges.get(edge, 0)) for edge, count in pred_edges.items())
+    fp = sum(pred_edges.values()) - tp
+    fn = sum(gt_edges.values()) - tp
+    precision = tp / (tp + fp) if (tp + fp) else np.nan
+    recall = tp / (tp + fn) if (tp + fn) else np.nan
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if np.isfinite(precision) and np.isfinite(recall) and (precision + recall) > 0
+        else np.nan
+    )
+    return precision, recall, f1, tp, fp, fn
+
+def assigned_position_errors(trajectories, gt_by_id):
+    errors = []
+    for traj in trajectories:
+        if not valid_gt_id(traj.id, gt_by_id):
+            continue
+        gt_traj = gt_by_id[traj.id]
+        for frame in traj.frames():
+            pos = traj.get_position_at_frame(frame)
+            gt_pos = gt_traj.get_position_at_frame(frame)
+            if pos is None or gt_pos is None:
+                continue
+            errors.append(float(np.linalg.norm(np.asarray(pos) - np.asarray(gt_pos))))
+    return np.asarray(errors, dtype=float)
+
+def coverage_and_fragments(trajectories, trajectories_gt):
+    gt_by_id = {traj.id: traj for traj in trajectories_gt if traj.id is not None and traj.length() > 0}
+    recovered_frames = {gid: set() for gid in gt_by_id}
+    fragment_counts = {gid: 0 for gid in gt_by_id}
+    assigned_tracks = 0
+    unassigned_tracks = 0
+
+    for traj in trajectories:
+        if traj.length() == 0:
+            continue
+        if not valid_gt_id(traj.id, gt_by_id):
+            unassigned_tracks += 1
+            continue
+        assigned_tracks += 1
+        fragment_counts[traj.id] += 1
+        gt_traj = gt_by_id[traj.id]
+        for frame in traj.frames():
+            if gt_traj.get_position_at_frame(frame) is not None:
+                recovered_frames[traj.id].add(frame)
+
+    coverage = []
+    fragments = []
+    for gid, gt_traj in gt_by_id.items():
+        coverage.append(len(recovered_frames[gid]) / gt_traj.length())
+        fragments.append(fragment_counts[gid])
+
+    return {
+        "coverage": np.asarray(coverage, dtype=float),
+        "fragments": np.asarray(fragments, dtype=float),
+        "assigned_tracks": assigned_tracks,
+        "unassigned_tracks": unassigned_tracks,
+    }
+
+def detections_by_frame(trajectories, identity="track"):
+    by_frame = {}
+    for track_idx, traj in enumerate(trajectories):
+        if traj.length() == 0:
+            continue
+        det_id = track_idx if identity == "track" else traj.id
+        if identity == "gt" and (det_id is None or det_id == -1):
+            continue
+        for frame in traj.frames():
+            pos = traj.get_position_at_frame(frame)
+            if pos is None:
+                continue
+            by_frame.setdefault(int(frame), []).append({
+                "id": det_id,
+                "pos": np.asarray(pos, dtype=float),
+            })
+    return by_frame
+
+def match_detections_by_frame(trajectories, trajectories_gt, tolerance_px=TRUTH_MATCH_TOLERANCE_PX):
+    pred_by_frame = detections_by_frame(trajectories, identity="track")
+    gt_by_frame = detections_by_frame(trajectories_gt, identity="gt")
+    total_pred = sum(len(v) for v in pred_by_frame.values())
+    total_gt = sum(len(v) for v in gt_by_frame.values())
+    match_rows = []
+
+    for frame in sorted(set(pred_by_frame) | set(gt_by_frame)):
+        preds = pred_by_frame.get(frame, [])
+        gts = gt_by_frame.get(frame, [])
+        if not preds or not gts:
+            continue
+
+        cost = np.empty((len(preds), len(gts)), dtype=float)
+        for i, pred in enumerate(preds):
+            for j, gt in enumerate(gts):
+                cost[i, j] = float(np.linalg.norm(pred["pos"] - gt["pos"]))
+
+        row_ind, col_ind = linear_sum_assignment(cost)
+        for i, j in zip(row_ind, col_ind):
+            error_px = float(cost[i, j])
+            if error_px <= tolerance_px:
+                match_rows.append({
+                    "frame": int(frame),
+                    "gt_id": gts[j]["id"],
+                    "track_id": preds[i]["id"],
+                    "error_px": error_px,
+                })
+
+    return pd.DataFrame(match_rows), total_pred, total_gt
+
+def fragmentation_count(gt_frames, matched_frames):
+    matched_frames = set(matched_frames)
+    was_matched = False
+    has_been_matched = False
+    n_fragments = 0
+
+    for frame in sorted(gt_frames):
+        is_matched = frame in matched_frames
+        if is_matched and has_been_matched and not was_matched:
+            n_fragments += 1
+        if is_matched:
+            has_been_matched = True
+        was_matched = is_matched
+
+    return n_fragments
+
+
+def hota_only(trajectories, trajectories_gt, tolerance_px=TRUTH_MATCH_TOLERANCE_PX):
+    matches, total_pred, total_gt = match_detections_by_frame(
+        trajectories,
+        trajectories_gt,
+        tolerance_px=tolerance_px,
+    )
+
+    tp = int(len(matches))
+    fp = int(total_pred - tp)
+    fn = int(total_gt - tp)
+
+    # Detection accuracy (DetA)
+    det_a = tp / (tp + fp + fn) if (tp + fp + fn) else np.nan
+
+    # Association accuracy (AssA)
+    if tp:
+        pair_counts = Counter(zip(matches["gt_id"], matches["track_id"]))
+        gt_counts = Counter(matches["gt_id"])
+        track_counts = Counter(matches["track_id"])
+        ass_scores = []
+        for gt_id, track_id in zip(matches["gt_id"], matches["track_id"]):
+            tpa = pair_counts[(gt_id, track_id)]
+            fna = gt_counts[gt_id] - tpa
+            fpa = track_counts[track_id] - tpa
+            ass_scores.append(tpa / (tpa + fna + fpa))
+        ass_a = finite_mean(ass_scores)
+    else:
+        ass_a = np.nan
+
+    # HOTA
+    hota = (
+        float(np.sqrt(det_a * ass_a))
+        if np.isfinite(det_a) and np.isfinite(ass_a)
+        else np.nan
+    )
+
+    return {
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "deta": det_a,
+        "assa": ass_a,
+        "hota": hota,
+    }
+
 

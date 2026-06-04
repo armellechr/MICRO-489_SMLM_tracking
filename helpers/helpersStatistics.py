@@ -1229,6 +1229,8 @@ def plot_det_vs_loc_core_figure(
 # HOTA helpers
 # =============================================================================
 
+TRUTH_MATCH_TOLERANCE_PX = 3.0
+
 def finite_mean(values):
     values = np.asarray(values, dtype=float)
     values = values[np.isfinite(values)]

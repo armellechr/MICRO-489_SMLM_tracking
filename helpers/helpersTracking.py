@@ -607,20 +607,25 @@ def track_peaks_to_trajectories(
 
         gated_cost = cost_matrix.copy()
 
+        assignment_threshold = (
+            np.inf if row_max_distances is None else np.max(row_max_distances)
+        )
+
         if algorithm == 'hungarian':
             min_cost_frame, assignment = hungarian(gated_cost)
         elif algorithm == 'local_nn':
-            assignment_threshold = (
-                np.inf if row_max_distances is None else np.max(row_max_distances)
-            )
             min_cost_frame, assignment = local_nn_assignment(gated_cost, max_distance=assignment_threshold)
         elif algorithm == 'global_nn':
-            assignment_threshold = (
-                np.inf if row_max_distances is None else np.max(row_max_distances)
-            )
             min_cost_frame, assignment = global_nn_assignment(gated_cost, max_distance=assignment_threshold)
+        elif algorithm == 'greedy_nn':
+            min_cost_frame, assignment = greedy_one_to_one_assignment(gated_cost, max_distance=assignment_threshold)
+        elif algorithm == 'mutual_nn':
+            min_cost_frame, assignment = mutual_nn_assignment(gated_cost, max_distance=assignment_threshold)
         else:
-            raise ValueError("Invalid algorithm. Choose 'hungarian', 'local_nn', or 'global_nn'.")
+            raise ValueError(
+                "Invalid algorithm. Choose 'hungarian', 'local_nn', 'global_nn', "
+                "'greedy_nn', or 'mutual_nn'."
+            )
         
         min_cost_frames.append(min_cost_frame) #TODO: study shape of min_cost_frames...
 
@@ -1239,9 +1244,9 @@ def track(
         If True, stitch compatible trajectory fragments before GT assignment.
     r_squared_threshold : float, optional
         Minimum Gaussian fit quality required to keep a localized peak.
-    algo_peak2peak : {"hungarian", "local_nn", "global_nn"}, optional
+    algo_peak2peak : {"hungarian", "local_nn", "global_nn", "greedy_nn", "mutual_nn"}, optional
         Assignment algorithm used for frame-to-frame peak linking.
-    algo_traj2traj : {"hungarian", "local_nn", "global_nn"}, optional
+    algo_traj2traj : {"hungarian", "local_nn", "global_nn", "greedy_nn", "mutual_nn"}, optional
         Assignment algorithm used to match localized trajectories to
         ground-truth trajectories.
     cost_func_peak2peak : callable, optional

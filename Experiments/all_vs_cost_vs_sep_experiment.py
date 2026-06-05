@@ -29,7 +29,7 @@ def _project_root() -> Path:
     ]
 
     for candidate in candidates:
-        if (candidate / "helpers").exists():
+        if (candidate / "Helpers").exists():
             return candidate
 
     raise RuntimeError(f"Could not find project root from {cwd}")
@@ -40,15 +40,15 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 os.chdir(PROJECT_ROOT)
 
-from helpers.helpersAssignment import (  # noqa: E402
+from Helpers.helpersAssignment import (  # noqa: E402
     LengthDifferenceTerm,
     MeanPositionDistanceTerm,
     StartFrameDifferenceTerm,
     TrajToTraj,
     assign_trajectories,
 )
-from helpers.helpersSimulation import LigandReceptorSimulator, Simulator  # noqa: E402
-from helpers.helpersTracking import (  # noqa: E402
+from Helpers.helpersSimulation import LigandReceptorSimulator, Simulator  # noqa: E402
+from Helpers.helpersTracking import (  # noqa: E402
     DistanceTerm,
     IntensityTerm,
     PeakToPeak,
@@ -64,7 +64,7 @@ from helpers.helpersTracking import (  # noqa: E402
 # Output paths
 # =============================================================================
 
-OUT_DIR = PROJECT_ROOT / "Experiments"
+OUT_DIR = PROJECT_ROOT / "Results"
 OUT_DIR.mkdir(exist_ok=True)
 
 RESULTS_PATH = OUT_DIR / "AllvsCostvsSep_hota_results.csv"

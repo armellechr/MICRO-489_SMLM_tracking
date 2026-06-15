@@ -1375,7 +1375,7 @@ def extract_peaks(
     frames, 
     mode='detection', 
     detection_threshold=None, 
-    r_squared_threshold=0.5, 
+    r_squared_threshold=0.45, 
     verbose_loc=False, 
     visualization_loc=False):
     """Performs peak detection and optional Gaussian localization on the input frames."""
